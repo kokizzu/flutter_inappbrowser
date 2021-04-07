@@ -1,21 +1,12 @@
 package com.pichillilorenzo.flutter_inappwebview;
 
-import android.annotation.TargetApi;
-import android.content.Context;
-import android.os.AsyncTask;
 import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
-import android.os.Message;
-import android.util.Log;
 import android.webkit.CookieManager;
 import android.webkit.CookieSyncManager;
 import android.webkit.ValueCallback;
 
 import androidx.annotation.Nullable;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -24,25 +15,22 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
-import java.util.concurrent.Executors;
 
-import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
-import io.flutter.plugin.common.PluginRegistry;
 
 public class MyCookieManager implements MethodChannel.MethodCallHandler {
 
   static final String LOG_TAG = "MyCookieManager";
 
-  public static MethodChannel channel;
+  public MethodChannel channel;
   public static CookieManager cookieManager;
+  @Nullable
+  public InAppWebViewFlutterPlugin plugin;
 
-  // As CookieManager was synchronous before API 21 this class emulates the async behavior on <21.
-  private static final boolean USES_LEGACY_STORE = Build.VERSION.SDK_INT < 21;
-
-  public MyCookieManager(BinaryMessenger messenger) {
-    channel = new MethodChannel(messenger, "com.pichillilorenzo/flutter_inappwebview_cookiemanager");
+  public MyCookieManager(final InAppWebViewFlutterPlugin plugin) {
+    this.plugin = plugin;
+    channel = new MethodChannel(plugin.messenger, "com.pichillilorenzo/flutter_inappwebview_cookiemanager");
     channel.setMethodCallHandler(this);
     cookieManager = getCookieManager();
   }
@@ -63,7 +51,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
           Boolean isSecure = (Boolean) call.argument("isSecure");
           Boolean isHttpOnly = (Boolean) call.argument("isHttpOnly");
           String sameSite = (String) call.argument("sameSite");
-          MyCookieManager.setCookie(url,
+          setCookie(url,
                   name,
                   value,
                   domain,
@@ -77,7 +65,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
         }
         break;
       case "getCookies":
-        result.success(MyCookieManager.getCookies((String) call.argument("url")));
+        result.success(getCookies((String) call.argument("url")));
         break;
       case "deleteCookie":
         {
@@ -85,7 +73,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
           String name = (String) call.argument("name");
           String domain = (String) call.argument("domain");
           String path = (String) call.argument("path");
-          MyCookieManager.deleteCookie(url, name, domain, path, result);
+          deleteCookie(url, name, domain, path, result);
         }
         break;
       case "deleteCookies":
@@ -93,11 +81,11 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
           String url = (String) call.argument("url");
           String domain = (String) call.argument("domain");
           String path = (String) call.argument("path");
-          MyCookieManager.deleteCookies(url, domain, path, result);
+          deleteCookies(url, domain, path, result);
         }
         break;
       case "deleteAllCookies":
-        MyCookieManager.deleteAllCookies(result);
+        deleteAllCookies(result);
         break;
       default:
         result.notImplemented();
@@ -138,7 +126,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
     return cookieManager;
   }
 
-  public static void setCookie(String url,
+  public void setCookie(String url,
                                String name,
                                String value,
                                String domain,
@@ -181,7 +169,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
       cookieManager.flush();
     }
     else {
-      CookieSyncManager cookieSyncMngr = CookieSyncManager.createInstance(Shared.applicationContext);
+      CookieSyncManager cookieSyncMngr = CookieSyncManager.createInstance(plugin.applicationContext);
       cookieSyncMngr.startSync();
       cookieManager.setCookie(url, cookieValue);
       result.success(true);
@@ -190,7 +178,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
     }
   }
 
-  public static List<Map<String, Object>> getCookies(final String url) {
+  public List<Map<String, Object>> getCookies(final String url) {
 
     final List<Map<String, Object>> cookieListMap = new ArrayList<>();
 
@@ -223,7 +211,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
 
   }
 
-  public static void deleteCookie(String url, String name, String domain, String path, final MethodChannel.Result result) {
+  public void deleteCookie(String url, String name, String domain, String path, final MethodChannel.Result result) {
     cookieManager = getCookieManager();
     if (cookieManager == null) return;
 
@@ -239,7 +227,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
       cookieManager.flush();
     }
     else {
-      CookieSyncManager cookieSyncMngr = CookieSyncManager.createInstance(Shared.applicationContext);
+      CookieSyncManager cookieSyncMngr = CookieSyncManager.createInstance(plugin.applicationContext);
       cookieSyncMngr.startSync();
       cookieManager.setCookie(url, cookieValue);
       result.success(true);
@@ -248,7 +236,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
     }
   }
 
-  public static void deleteCookies(String url, String domain, String path, final MethodChannel.Result result) {
+  public void deleteCookies(String url, String domain, String path, final MethodChannel.Result result) {
     cookieManager = getCookieManager();
     if (cookieManager == null) return;
 
@@ -258,7 +246,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
     if (cookiesString != null) {
 
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
-        cookieSyncMngr = CookieSyncManager.createInstance(Shared.applicationContext);
+        cookieSyncMngr = CookieSyncManager.createInstance(plugin.applicationContext);
         cookieSyncMngr.startSync();
       }
 
@@ -282,7 +270,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
     result.success(true);
   }
 
-  public static void deleteAllCookies(final MethodChannel.Result result) {
+  public void deleteAllCookies(final MethodChannel.Result result) {
     cookieManager = getCookieManager();
     if (cookieManager == null) return;
 
@@ -296,7 +284,7 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
       cookieManager.flush();
     }
     else {
-      CookieSyncManager cookieSyncMngr = CookieSyncManager.createInstance(Shared.applicationContext);
+      CookieSyncManager cookieSyncMngr = CookieSyncManager.createInstance(plugin.applicationContext);
       cookieSyncMngr.startSync();
       cookieManager.removeAllCookie();
       result.success(true);
@@ -306,12 +294,13 @@ public class MyCookieManager implements MethodChannel.MethodCallHandler {
   }
 
   public static String getCookieExpirationDate(Long timestamp) {
-    final SimpleDateFormat sdf = new SimpleDateFormat("EEE, d MMM yyyy hh:mm:ss z", Locale.US);
+    final SimpleDateFormat sdf = new SimpleDateFormat("EEE, dd MMM yyyy hh:mm:ss z", Locale.US);
     sdf.setTimeZone(TimeZone.getTimeZone("GMT"));
     return sdf.format(new Date(timestamp));
   }
 
   public void dispose() {
     channel.setMethodCallHandler(null);
+    plugin = null;
   }
 }

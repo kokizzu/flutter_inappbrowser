@@ -1,6 +1,4 @@
-import 'package:flutter/foundation.dart';
-
-import 'webview.dart';
+import 'in_app_webview/webview.dart';
 import 'types.dart';
 
 ///Class that represents the WebView context menu. It used by [WebView.contextMenu].
@@ -67,10 +65,7 @@ class ContextMenuItem {
   Function()? action;
 
   ContextMenuItem(
-      {this.androidId,
-      this.iosId,
-      required this.title,
-      this.action});
+      {this.androidId, this.iosId, required this.title, this.action});
 
   Map<String, dynamic> toMap() {
     return {"androidId": androidId, "iosId": iosId, "title": title};

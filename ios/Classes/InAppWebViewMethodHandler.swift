@@ -8,7 +8,7 @@
 import Foundation
 import WebKit
 
-class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
+public class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
     var webView: InAppWebView?
     
     init(webView: InAppWebView) {
@@ -30,37 +30,41 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 result( (webView != nil) ? Int(webView!.estimatedProgress * 100) : nil )
                 break
             case "loadUrl":
-                let url = arguments!["url"] as! String
-                let headers = arguments!["headers"] as! [String: String]
-                webView?.loadUrl(url: URL(string: url)!, headers: headers)
+                let urlRequest = arguments!["urlRequest"] as! [String:Any?]
+                let allowingReadAccessTo = arguments!["allowingReadAccessTo"] as? String
+                var allowingReadAccessToURL: URL? = nil
+                if let allowingReadAccessTo = allowingReadAccessTo {
+                    allowingReadAccessToURL = URL(string: allowingReadAccessTo)
+                }
+                webView?.loadUrl(urlRequest: URLRequest.init(fromPluginMap: urlRequest), allowingReadAccessTo: allowingReadAccessToURL)
                 result(true)
                 break
             case "postUrl":
-                if webView != nil {
+                if let webView = webView {
                     let url = arguments!["url"] as! String
                     let postData = arguments!["postData"] as! FlutterStandardTypedData
-                    webView!.postUrl(url: URL(string: url)!, postData: postData.data, completionHandler: { () -> Void in
-                        result(true)
-                    })
+                    webView.postUrl(url: URL(string: url)!, postData: postData.data)
                 }
-                else {
-                    result(false)
-                }
+                result(true)
                 break
             case "loadData":
                 let data = arguments!["data"] as! String
                 let mimeType = arguments!["mimeType"] as! String
                 let encoding = arguments!["encoding"] as! String
-                let baseUrl = arguments!["baseUrl"] as! String
-                webView?.loadData(data: data, mimeType: mimeType, encoding: encoding, baseUrl: baseUrl)
+                let baseUrl = URL(string: arguments!["baseUrl"] as! String)!
+                let allowingReadAccessTo = arguments!["allowingReadAccessTo"] as? String
+                var allowingReadAccessToURL: URL? = nil
+                if let allowingReadAccessTo = allowingReadAccessTo {
+                    allowingReadAccessToURL = URL(string: allowingReadAccessTo)
+                }
+                webView?.loadData(data: data, mimeType: mimeType, encoding: encoding, baseUrl: baseUrl, allowingReadAccessTo: allowingReadAccessToURL)
                 result(true)
                 break
             case "loadFile":
-                let url = arguments!["url"] as! String
-                let headers = arguments!["headers"] as! [String: String]
+                let assetFilePath = arguments!["assetFilePath"] as! String
                 
                 do {
-                    try webView?.loadFile(url: url, headers: headers)
+                    try webView?.loadFile(assetFilePath: assetFilePath)
                 }
                 catch let error as NSError {
                     result(FlutterError(code: "InAppWebViewMethodHandler", message: error.domain, details: nil))
@@ -69,10 +73,19 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 result(true)
                 break
             case "evaluateJavascript":
-                if webView != nil {
+                if let webView = webView {
                     let source = arguments!["source"] as! String
-                    let contentWorldName = arguments!["contentWorld"] as? String
-                    webView!.evaluateJavascript(source: source, contentWorldName: contentWorldName, result: result)
+                    let contentWorldMap = arguments!["contentWorld"] as? [String:Any?]
+                    if #available(iOS 14.0, *), let contentWorldMap = contentWorldMap {
+                        let contentWorld = WKContentWorld.fromMap(map: contentWorldMap, windowId: webView.windowId)!
+                        webView.evaluateJavascript(source: source, contentWorld: contentWorld) { (value) in
+                            result(value)
+                        }
+                    } else {
+                        webView.evaluateJavascript(source: source) { (value) in
+                            result(value)
+                        }
+                    }
                 }
                 else {
                     result(nil)
@@ -130,9 +143,9 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 result(webView?.isLoading ?? false)
                 break
             case "takeScreenshot":
-                if webView != nil, #available(iOS 11.0, *) {
+                if let webView = webView, #available(iOS 11.0, *) {
                     let screenshotConfiguration = arguments!["screenshotConfiguration"] as? [String: Any?]
-                    webView!.takeScreenshot(with: screenshotConfiguration, completionHandler: { (screenshot) -> Void in
+                    webView.takeScreenshot(with: screenshotConfiguration, completionHandler: { (screenshot) -> Void in
                         result(screenshot)
                     })
                 }
@@ -141,7 +154,7 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "setOptions":
-                if let iabController = webView?.IABController {
+                if let iabController = webView?.inAppBrowserDelegate as? InAppBrowserWebViewController {
                     let inAppBrowserOptions = InAppBrowserOptions()
                     let inAppBrowserOptionsMap = arguments!["options"] as! [String: Any]
                     let _ = inAppBrowserOptions.parse(options: inAppBrowserOptionsMap)
@@ -155,32 +168,35 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 result(true)
                 break
             case "getOptions":
-                if let iabController = webView?.IABController {
+                if let iabController = webView?.inAppBrowserDelegate as? InAppBrowserWebViewController {
                     result(iabController.getOptions())
                 } else {
                     result(webView?.getOptions())
                 }
                 break
             case "close":
-                if let iabController = webView?.IABController {
-                    iabController.close()
-                    result(true)
+                if let iabController = webView?.inAppBrowserDelegate as? InAppBrowserWebViewController {
+                    iabController.close {
+                        result(true)
+                    }
                 } else {
                     result(FlutterMethodNotImplemented)
                 }
                 break
             case "show":
-                if let iabController = webView?.IABController {
-                    iabController.show()
-                    result(true)
+                if let iabController = webView?.inAppBrowserDelegate as? InAppBrowserWebViewController {
+                    iabController.show {
+                        result(true)
+                    }
                 } else {
                     result(FlutterMethodNotImplemented)
                 }
                 break
             case "hide":
-                if let iabController = webView?.IABController {
-                    iabController.hide()
-                    result(true)
+                if let iabController = webView?.inAppBrowserDelegate as? InAppBrowserWebViewController {
+                    iabController.hide {
+                        result(true)
+                    }
                 } else {
                     result(FlutterMethodNotImplemented)
                 }
@@ -189,9 +205,9 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 result(webView?.getCopyBackForwardList())
                 break
             case "findAllAsync":
-                if webView != nil {
+                if let webView = webView {
                     let find = arguments!["find"] as! String
-                    webView!.findAllAsync(find: find, completionHandler: {(value, error) in
+                    webView.findAllAsync(find: find, completionHandler: {(value, error) in
                     if error != nil {
                         result(FlutterError(code: "InAppWebViewMethodHandler", message: error?.localizedDescription, details: nil))
                         return
@@ -203,9 +219,9 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "findNext":
-                if webView != nil {
+                if let webView = webView {
                     let forward = arguments!["forward"] as! Bool
-                    webView!.findNext(forward: forward, completionHandler: {(value, error) in
+                    webView.findNext(forward: forward, completionHandler: {(value, error) in
                         if error != nil {
                             result(FlutterError(code: "InAppWebViewMethodHandler", message: error?.localizedDescription, details: nil))
                             return
@@ -217,8 +233,8 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "clearMatches":
-                if webView != nil {
-                    webView!.clearMatches(completionHandler: {(value, error) in
+                if let webView = webView {
+                    webView.clearMatches(completionHandler: {(value, error) in
                         if error != nil {
                             result(FlutterError(code: "InAppWebViewMethodHandler", message: error?.localizedDescription, details: nil))
                             return
@@ -249,15 +265,15 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 break
             case "pauseTimers":
                 webView?.pauseTimers()
-               result(true)
-               break
+                result(true)
+                break
             case "resumeTimers":
                 webView?.resumeTimers()
                 result(true)
                 break
             case "printCurrentPage":
-                if webView != nil {
-                    webView!.printCurrentPage(printCompletionHandler: {(completed, error) in
+                if let webView = webView {
+                    webView.printCurrentPage(printCompletionHandler: {(completed, error) in
                         if !completed, let err = error {
                             print(err.localizedDescription)
                             result(false)
@@ -282,15 +298,15 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 webView?.reloadFromOrigin()
                 result(true)
                 break
-            case "getScale":
-                result(webView?.getScale())
+            case "getZoomScale":
+                result(webView?.getZoomScale())
                 break
             case "hasOnlySecureContent":
-                result(webView?.hasOnlySecureContent)
+                result(webView?.hasOnlySecureContent ?? false)
                 break
             case "getSelectedText":
-                if webView != nil {
-                    webView!.getSelectedText { (value, error) in
+                if let webView = webView {
+                    webView.getSelectedText { (value, error) in
                         if let err = error {
                             print(err.localizedDescription)
                             result("")
@@ -304,14 +320,9 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "getHitTestResult":
-                if webView != nil {
-                    webView!.getHitTestResult { (value, error) in
-                        if let err = error {
-                            print(err.localizedDescription)
-                            result(nil)
-                            return
-                        }
-                        result(value)
+                if let webView = webView {
+                    webView.getHitTestResult { (hitTestResult) in
+                        result(hitTestResult.toMap())
                     }
                 }
                 else {
@@ -323,17 +334,17 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 result(true)
                 break
             case "setContextMenu":
-                if webView != nil {
+                if let webView = webView {
                     let contextMenu = arguments!["contextMenu"] as? [String: Any]
-                    webView!.contextMenu = contextMenu
+                    webView.contextMenu = contextMenu
                     result(true)
                 } else {
                     result(false)
                 }
                 break
             case "requestFocusNodeHref":
-                if webView != nil {
-                    webView!.requestFocusNodeHref { (value, error) in
+                if let webView = webView {
+                    webView.requestFocusNodeHref { (value, error) in
                         if let err = error {
                             print(err.localizedDescription)
                             result(nil)
@@ -346,8 +357,8 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "requestImageRef":
-                if webView != nil {
-                    webView!.requestImageRef { (value, error) in
+                if let webView = webView {
+                    webView.requestImageRef { (value, error) in
                         if let err = error {
                             print(err.localizedDescription)
                             result(nil)
@@ -360,54 +371,75 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "getScrollX":
-                if webView != nil {
-                    result(Int(webView!.scrollView.contentOffset.x))
+                if let webView = webView {
+                    result(Int(webView.scrollView.contentOffset.x))
                 } else {
                     result(nil)
                 }
                 break
             case "getScrollY":
-                if webView != nil {
-                    result(Int(webView!.scrollView.contentOffset.y))
+                if let webView = webView {
+                    result(Int(webView.scrollView.contentOffset.y))
                 } else {
                     result(nil)
                 }
                 break
             case "getCertificate":
-                result(webView?.getCertificateMap())
+                result(webView?.getCertificate()?.toMap())
                 break
             case "addUserScript":
-                let userScript = arguments!["userScript"] as! [String: Any]
-                let wkUserScript = WKUserScript(source: userScript["source"] as! String,
-                                                injectionTime: WKUserScriptInjectionTime.init(rawValue: userScript["injectionTime"] as! Int) ?? .atDocumentStart,
-                                                forMainFrameOnly: userScript["iosForMainFrameOnly"] as! Bool)
-                webView?.addUserScript(wkUserScript: wkUserScript)
+                if let webView = webView {
+                    let userScriptMap = arguments!["userScript"] as! [String: Any?]
+                    let userScript = UserScript.fromMap(map: userScriptMap, windowId: webView.windowId)!
+                    webView.configuration.userContentController.addUserOnlyScript(userScript)
+                    webView.configuration.userContentController.sync(scriptMessageHandler: webView)
+                }
                 result(true)
                 break
             case "removeUserScript":
                 let index = arguments!["index"] as! Int
-                webView?.removeUserScript(at: index)
+                let userScriptMap = arguments!["userScript"] as! [String: Any?]
+                let userScript = UserScript.fromMap(map: userScriptMap, windowId: webView?.windowId)!
+                webView?.configuration.userContentController.removeUserOnlyScript(at: index, injectionTime: userScript.injectionTime)
+                result(true)
+                break
+            case "removeUserScriptsByGroupName":
+                let groupName = arguments!["groupName"] as! String
+                webView?.configuration.userContentController.removeUserOnlyScripts(with: groupName)
                 result(true)
                 break
             case "removeAllUserScripts":
-                webView?.removeAllUserScripts()
+                webView?.configuration.userContentController.removeAllUserOnlyScripts()
                 result(true)
                 break
             case "callAsyncJavaScript":
-                if webView != nil, #available(iOS 10.3, *) {
-                    let functionBody = arguments!["functionBody"] as! String
-                    let functionArguments = arguments!["arguments"] as! [String:Any]
-                    let contentWorldName = arguments!["contentWorld"] as? String
-                    webView!.callAsyncJavaScript(functionBody: functionBody, arguments: functionArguments, contentWorldName: contentWorldName, result: result)
+                if let webView = webView, #available(iOS 10.3, *) {
+                    if #available(iOS 14.0, *) {
+                        let functionBody = arguments!["functionBody"] as! String
+                        let functionArguments = arguments!["arguments"] as! [String:Any]
+                        var contentWorld = WKContentWorld.page
+                        if let contentWorldMap = arguments!["contentWorld"] as? [String:Any?] {
+                            contentWorld = WKContentWorld.fromMap(map: contentWorldMap, windowId: webView.windowId)!
+                        }
+                        webView.callAsyncJavaScript(functionBody: functionBody, arguments: functionArguments, contentWorld: contentWorld) { (value) in
+                            result(value)
+                        }
+                    } else {
+                        let functionBody = arguments!["functionBody"] as! String
+                        let functionArguments = arguments!["arguments"] as! [String:Any]
+                        webView.callAsyncJavaScript(functionBody: functionBody, arguments: functionArguments) { (value) in
+                            result(value)
+                        }
+                    }
                 }
                 else {
                     result(nil)
                 }
                 break
             case "createPdf":
-                if webView != nil, #available(iOS 14.0, *) {
+                if let webView = webView, #available(iOS 14.0, *) {
                     let configuration = arguments!["iosWKPdfConfiguration"] as? [String: Any?]
-                    webView!.createPdf(configuration: configuration, completionHandler: { (pdf) -> Void in
+                    webView.createPdf(configuration: configuration, completionHandler: { (pdf) -> Void in
                         result(pdf)
                     })
                 }
@@ -416,8 +448,8 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "createWebArchiveData":
-                if webView != nil, #available(iOS 14.0, *) {
-                    webView!.createWebArchiveData(dataCompletionHandler: { (webArchiveData) -> Void in
+                if let webView = webView, #available(iOS 14.0, *) {
+                    webView.createWebArchiveData(dataCompletionHandler: { (webArchiveData) -> Void in
                         result(webArchiveData)
                     })
                 }
@@ -426,15 +458,90 @@ class InAppWebViewMethodHandler: FlutterMethodCallDelegate {
                 }
                 break
             case "saveWebArchive":
-                if webView != nil, #available(iOS 14.0, *) {
+                if let webView = webView, #available(iOS 14.0, *) {
                     let filePath = arguments!["filePath"] as! String
                     let autoname = arguments!["autoname"] as! Bool
-                    webView!.saveWebArchive(filePath: filePath, autoname: autoname, completionHandler: { (path) -> Void in
+                    webView.saveWebArchive(filePath: filePath, autoname: autoname, completionHandler: { (path) -> Void in
                         result(path)
                     })
                 }
                 else {
                     result(nil)
+                }
+                break
+            case "isSecureContext":
+                if let webView = webView {
+                    webView.isSecureContext(completionHandler: { (isSecureContext) in
+                        result(isSecureContext)
+                    })
+                }
+                else {
+                    result(false)
+                }
+                break
+            case "createWebMessageChannel":
+                if let webView = webView {
+                    let _ = webView.createWebMessageChannel { (webMessageChannel) in
+                        result(webMessageChannel.toMap())
+                    }
+                } else {
+                    result(nil)
+                }
+                break
+            case "postWebMessage":
+                if let webView = webView {
+                    let message = arguments!["message"] as! [String: Any?]
+                    let targetOrigin = arguments!["targetOrigin"] as! String
+                    
+                    var ports: [WebMessagePort] = []
+                    let portsMap = message["ports"] as? [[String: Any?]]
+                    if let portsMap = portsMap {
+                        for portMap in portsMap {
+                            let webMessageChannelId = portMap["webMessageChannelId"] as! String
+                            let index = portMap["index"] as! Int
+                            if let webMessageChannel = webView.webMessageChannels[webMessageChannelId] {
+                                ports.append(webMessageChannel.ports[index])
+                            }
+                        }
+                    }
+                    let webMessage = WebMessage(data: message["data"] as? String, ports: ports)
+                    do {
+                        try webView.postWebMessage(message: webMessage, targetOrigin: targetOrigin) { (_) in
+                            result(true)
+                        }
+                    } catch let error as NSError {
+                        result(FlutterError(code: "InAppWebViewMethodHandler", message: error.domain, details: nil))
+                    }
+                } else {
+                    result(false)
+                }
+                break
+            case "addWebMessageListener":
+                if let webView = webView {
+                    let webMessageListenerMap = arguments!["webMessageListener"] as! [String: Any?]
+                    let webMessageListener = WebMessageListener.fromMap(map: webMessageListenerMap)!
+                    do {
+                        try webView.addWebMessageListener(webMessageListener: webMessageListener)
+                        result(false)
+                    } catch let error as NSError {
+                        result(FlutterError(code: "InAppWebViewMethodHandler", message: error.domain, details: nil))
+                    }
+                } else {
+                    result(false)
+                }
+                break
+            case "canScrollVertically":
+                if let webView = webView {
+                    result(webView.canScrollVertically())
+                } else {
+                    result(false)
+                }
+                break
+            case "canScrollHorizontally":
+                if let webView = webView {
+                    result(webView.canScrollHorizontally())
+                } else {
+                    result(false)
                 }
                 break
             default:

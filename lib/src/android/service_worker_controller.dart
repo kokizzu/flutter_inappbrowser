@@ -27,28 +27,19 @@ class AndroidServiceWorkerController {
   }
 
   static Future<dynamic> _handleMethod(MethodCall call) async {
-    AndroidServiceWorkerController controller = AndroidServiceWorkerController.instance();
-    AndroidServiceWorkerClient? serviceWorkerClient = controller.serviceWorkerClient;
+    AndroidServiceWorkerController controller =
+        AndroidServiceWorkerController.instance();
+    AndroidServiceWorkerClient? serviceWorkerClient =
+        controller.serviceWorkerClient;
 
     switch (call.method) {
       case "shouldInterceptRequest":
-        String url = call.arguments["url"];
-        String method = call.arguments["method"];
-        Map<String, String>? headers =
-        call.arguments["headers"]?.cast<String, String>();
-        bool isForMainFrame = call.arguments["isForMainFrame"];
-        bool hasGesture = call.arguments["hasGesture"];
-        bool isRedirect = call.arguments["isRedirect"];
+        if (serviceWorkerClient != null &&
+            serviceWorkerClient.shouldInterceptRequest != null) {
+          Map<String, dynamic> arguments =
+              call.arguments.cast<String, dynamic>();
+          WebResourceRequest request = WebResourceRequest.fromMap(arguments)!;
 
-        var request = new WebResourceRequest(
-            url: url,
-            method: method,
-            headers: headers,
-            isForMainFrame: isForMainFrame,
-            hasGesture: hasGesture,
-            isRedirect: isRedirect);
-
-        if (serviceWorkerClient != null && serviceWorkerClient.shouldInterceptRequest != null) {
           return (await serviceWorkerClient.shouldInterceptRequest!(request))
               ?.toMap();
         }
@@ -101,7 +92,8 @@ class AndroidServiceWorkerController {
   ///**Official Android API**: https://developer.android.com/reference/androidx/webkit/ServiceWorkerWebSettingsCompat#getCacheMode()
   static Future<AndroidCacheMode?> getCacheMode() async {
     Map<String, dynamic> args = <String, dynamic>{};
-    return AndroidCacheMode.fromValue(await _channel.invokeMethod('getCacheMode', args));
+    return AndroidCacheMode.fromValue(
+        await _channel.invokeMethod('getCacheMode', args));
   }
 
   ///Enables or disables content URL access from Service Workers.
@@ -159,7 +151,6 @@ class AndroidServiceWorkerController {
 ///
 ///**Official Android API**: https://developer.android.com/reference/androidx/webkit/ServiceWorkerClientCompat
 class AndroidServiceWorkerClient {
-
   ///Notify the host application of a resource request and allow the application to return the data.
   ///If the return value is `null`, the Service Worker will continue to load the resource as usual.
   ///Otherwise, the return response and data will be used.
@@ -171,9 +162,7 @@ class AndroidServiceWorkerClient {
   ///
   ///**NOTE**: available on Android 24+.
   final Future<WebResourceResponse?> Function(WebResourceRequest request)?
-    shouldInterceptRequest;
+      shouldInterceptRequest;
 
-  AndroidServiceWorkerClient({
-    this.shouldInterceptRequest
-  });
+  AndroidServiceWorkerClient({this.shouldInterceptRequest});
 }

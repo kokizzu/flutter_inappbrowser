@@ -1,18 +1,31 @@
 package com.pichillilorenzo.flutter_inappwebview;
 
+import android.net.Uri;
 import android.os.Build;
 import android.webkit.ValueCallback;
 import android.webkit.WebView;
 
 import androidx.annotation.NonNull;
+import androidx.webkit.WebMessageCompat;
+import androidx.webkit.WebMessagePortCompat;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
-import com.pichillilorenzo.flutter_inappwebview.InAppBrowser.InAppBrowserOptions;
-import com.pichillilorenzo.flutter_inappwebview.InAppWebView.InAppWebView;
-import com.pichillilorenzo.flutter_inappwebview.InAppWebView.InAppWebViewOptions;
+import com.pichillilorenzo.flutter_inappwebview.in_app_browser.InAppBrowserActivity;
+import com.pichillilorenzo.flutter_inappwebview.in_app_browser.InAppBrowserOptions;
+import com.pichillilorenzo.flutter_inappwebview.in_app_webview.InAppWebView;
+import com.pichillilorenzo.flutter_inappwebview.in_app_webview.InAppWebViewOptions;
+import com.pichillilorenzo.flutter_inappwebview.types.ContentWorld;
+import com.pichillilorenzo.flutter_inappwebview.types.SslCertificateExt;
+import com.pichillilorenzo.flutter_inappwebview.types.URLRequest;
+import com.pichillilorenzo.flutter_inappwebview.types.UserScript;
+import com.pichillilorenzo.flutter_inappwebview.types.WebMessageChannel;
+import com.pichillilorenzo.flutter_inappwebview.types.WebMessageListener;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import io.flutter.plugin.common.MethodCall;
@@ -40,42 +53,55 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
         result.success((webView != null) ? webView.getProgress() : null);
         break;
       case "loadUrl":
-        if (webView != null)
-          webView.loadUrl((String) call.argument("url"), (Map<String, String>) call.argument("headers"), result);
-        else
-          result.success(false);
+        if (webView != null) {
+          Map<String, Object> urlRequest = (Map<String, Object>) call.argument("urlRequest");
+          webView.loadUrl(URLRequest.fromMap(urlRequest));
+        }
+        result.success(true);
         break;
       case "postUrl":
-        if (webView != null)
-          webView.postUrl((String) call.argument("url"), (byte[]) call.argument("postData"), result);
-        else
-          result.success(false);
+        if (webView != null) {
+          String url = (String) call.argument("url");
+          byte[] postData = (byte[]) call.argument("postData");
+          webView.postUrl(url, postData);
+        }
+        result.success(true);
         break;
       case "loadData":
-      {
-        String data = (String) call.argument("data");
-        String mimeType = (String) call.argument("mimeType");
-        String encoding = (String) call.argument("encoding");
-        String baseUrl = (String) call.argument("baseUrl");
-        String historyUrl = (String) call.argument("historyUrl");
-
-        if (webView != null)
-          webView.loadData(data, mimeType, encoding, baseUrl, historyUrl, result);
-        else
-          result.success(false);
-      }
+        if (webView != null) {
+          String data = (String) call.argument("data");
+          String mimeType = (String) call.argument("mimeType");
+          String encoding = (String) call.argument("encoding");
+          String baseUrl = (String) call.argument("baseUrl");
+          String historyUrl = (String) call.argument("historyUrl");
+          webView.loadDataWithBaseURL(baseUrl, data, mimeType, encoding, historyUrl);
+        }
+        result.success(true);
       break;
       case "loadFile":
-        if (webView != null)
-          webView.loadFile((String) call.argument("url"), (Map<String, String>) call.argument("headers"), result);
-        else
-          result.success(false);
+        if (webView != null) {
+          String assetFilePath = (String) call.argument("assetFilePath");
+          try {
+            webView.loadFile(assetFilePath);
+          } catch (IOException e) {
+            e.printStackTrace();
+            result.error(LOG_TAG, e.getMessage(), null);
+            return;
+          }
+        }
+        result.success(true);
         break;
       case "evaluateJavascript":
         if (webView != null) {
           String source = (String) call.argument("source");
-          String contentWorldName = (String) call.argument("contentWorld");
-          webView.evaluateJavascript(source, contentWorldName, result);
+          Map<String, Object> contentWorldMap = (Map<String, Object>) call.argument("contentWorld");
+          ContentWorld contentWorld = ContentWorld.fromMap(contentWorldMap);
+          webView.evaluateJavascript(source, contentWorld, new ValueCallback<String>() {
+            @Override
+            public void onReceiveValue(String value) {
+              result.success(value);
+            }
+          });
         }
         else {
           result.success(null);
@@ -150,11 +176,12 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
           result.success(null);
         break;
       case "setOptions":
-        if (webView != null && webView.inAppBrowserActivity != null) {
+        if (webView != null && webView.inAppBrowserDelegate != null && webView.inAppBrowserDelegate instanceof InAppBrowserActivity) {
+          InAppBrowserActivity inAppBrowserActivity = (InAppBrowserActivity) webView.inAppBrowserDelegate;
           InAppBrowserOptions inAppBrowserOptions = new InAppBrowserOptions();
           HashMap<String, Object> inAppBrowserOptionsMap = (HashMap<String, Object>) call.argument("options");
           inAppBrowserOptions.parse(inAppBrowserOptionsMap);
-          webView.inAppBrowserActivity.setOptions(inAppBrowserOptions, inAppBrowserOptionsMap);
+          inAppBrowserActivity.setOptions(inAppBrowserOptions, inAppBrowserOptionsMap);
         } else if (webView != null) {
           InAppWebViewOptions inAppWebViewOptions = new InAppWebViewOptions();
           HashMap<String, Object> inAppWebViewOptionsMap = (HashMap<String, Object>) call.argument("options");
@@ -164,30 +191,34 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
         result.success(true);
         break;
       case "getOptions":
-        if (webView != null && webView.inAppBrowserActivity != null) {
-          result.success(webView.inAppBrowserActivity.getOptions());
+        if (webView != null && webView.inAppBrowserDelegate != null && webView.inAppBrowserDelegate instanceof InAppBrowserActivity) {
+          InAppBrowserActivity inAppBrowserActivity = (InAppBrowserActivity) webView.inAppBrowserDelegate;
+          result.success(inAppBrowserActivity.getOptions());
         } else {
           result.success((webView != null) ? webView.getOptions() : null);
         }
         break;
       case "close":
-        if (webView != null && webView.inAppBrowserActivity != null) {
-          webView.inAppBrowserActivity.close(result);
+        if (webView != null && webView.inAppBrowserDelegate != null && webView.inAppBrowserDelegate instanceof InAppBrowserActivity) {
+          InAppBrowserActivity inAppBrowserActivity = (InAppBrowserActivity) webView.inAppBrowserDelegate;
+          inAppBrowserActivity.close(result);
         } else {
           result.notImplemented();
         }
         break;
       case "show":
-        if (webView != null && webView.inAppBrowserActivity != null) {
-          webView.inAppBrowserActivity.show();
+        if (webView != null && webView.inAppBrowserDelegate != null && webView.inAppBrowserDelegate instanceof InAppBrowserActivity) {
+          InAppBrowserActivity inAppBrowserActivity = (InAppBrowserActivity) webView.inAppBrowserDelegate;
+          inAppBrowserActivity.show();
           result.success(true);
         } else {
           result.notImplemented();
         }
         break;
       case "hide":
-        if (webView != null && webView.inAppBrowserActivity != null) {
-          webView.inAppBrowserActivity.hide();
+        if (webView != null && webView.inAppBrowserDelegate != null && webView.inAppBrowserDelegate instanceof InAppBrowserActivity) {
+          InAppBrowserActivity inAppBrowserActivity = (InAppBrowserActivity) webView.inAppBrowserDelegate;
+          inAppBrowserActivity.hide();
           result.success(true);
         } else {
           result.notImplemented();
@@ -197,8 +228,7 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
         result.success((webView != null) ? webView.getCopyBackForwardList() : null);
         break;
       case "startSafeBrowsing":
-        if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 &&
-                WebViewFeature.isFeatureSupported(WebViewFeature.START_SAFE_BROWSING)) {
+        if (webView != null && WebViewFeature.isFeatureSupported(WebViewFeature.START_SAFE_BROWSING)) {
           WebViewCompat.startSafeBrowsing(webView.getContext(), new ValueCallback<Boolean>() {
             @Override
             public void onReceiveValue(Boolean success) {
@@ -301,8 +331,8 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
       case "getOriginalUrl":
         result.success((webView != null) ? webView.getOriginalUrl() : null);
         break;
-      case "getScale":
-        result.success((webView != null) ? webView.getUpdatedScale() : null);
+      case "getZoomScale":
+        result.success((webView != null) ? webView.zoomScale : null);
         break;
       case "getSelectedText":
         if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
@@ -409,7 +439,7 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
         break;
       case "getCertificate":
         if (webView != null) {
-          result.success(webView.getCertificateMap());
+          result.success(SslCertificateExt.toMap(webView.getCertificate()));
         } else {
           result.success(null);
         }
@@ -421,24 +451,34 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
         result.success(true);
         break;
       case "addUserScript":
-        if (webView != null) {
-          Map<String, Object> userScript = (Map<String, Object>) call.argument("userScript");
-          result.success(webView.addUserScript(userScript));
+        if (webView != null && webView.userContentController != null) {
+          Map<String, Object> userScriptMap = (Map<String, Object>) call.argument("userScript");
+          UserScript userScript = UserScript.fromMap(userScriptMap);
+          result.success(webView.userContentController.addUserOnlyScript(userScript));
         } else {
           result.success(false);
         }
         break;
       case "removeUserScript":
-        if (webView != null) {
+        if (webView != null && webView.userContentController != null) {
           Integer index = (Integer) call.argument("index");
-          result.success(webView.removeUserScript(index));
+          Map<String, Object> userScriptMap = (Map<String, Object>) call.argument("userScript");
+          UserScript userScript = UserScript.fromMap(userScriptMap);
+          result.success(webView.userContentController.removeUserOnlyScriptAt(index, userScript.getInjectionTime()));
         } else {
           result.success(false);
         }
         break;
+      case "removeUserScriptsByGroupName":
+        if (webView != null && webView.userContentController != null) {
+          String groupName = (String) call.argument("groupName");
+          webView.userContentController.removeUserOnlyScriptsByGroupName(groupName);
+        }
+        result.success(true);
+        break;
       case "removeAllUserScripts":
-        if (webView != null) {
-          webView.removeAllUserScripts();
+        if (webView != null && webView.userContentController != null) {
+          webView.userContentController.removeAllUserOnlyScripts();
         }
         result.success(true);
         break;
@@ -446,11 +486,91 @@ public class InAppWebViewMethodHandler implements MethodChannel.MethodCallHandle
         if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
           String functionBody = (String) call.argument("functionBody");
           Map<String, Object> functionArguments = (Map<String, Object>) call.argument("arguments");
-          String contentWorldName = (String) call.argument("contentWorld");
-          webView.callAsyncJavaScript(functionBody, functionArguments, contentWorldName, result);
+          Map<String, Object> contentWorldMap = (Map<String, Object>) call.argument("contentWorld");
+          ContentWorld contentWorld = ContentWorld.fromMap(contentWorldMap);
+          webView.callAsyncJavaScript(functionBody, functionArguments, contentWorld, new ValueCallback<String>() {
+            @Override
+            public void onReceiveValue(String value) {
+              result.success(value);
+            }
+          });
         }
         else {
           result.success(null);
+        }
+        break;
+      case "isSecureContext":
+        if (webView != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+          webView.isSecureContext(new ValueCallback<Boolean>() {
+            @Override
+            public void onReceiveValue(Boolean value) {
+              result.success(value);
+            }
+          });
+        } else {
+          result.success(false);
+        }
+        break;
+      case "createWebMessageChannel":
+        if (webView != null && WebViewFeature.isFeatureSupported(WebViewFeature.CREATE_WEB_MESSAGE_CHANNEL)) {
+          result.success(webView.createCompatWebMessageChannel().toMap());
+        } else {
+          result.success(null);
+        }
+        break;
+      case "postWebMessage":
+        if (webView != null && WebViewFeature.isFeatureSupported(WebViewFeature.POST_WEB_MESSAGE)) {
+          Map<String, Object> message = (Map<String, Object>) call.argument("message");
+          String targetOrigin = (String) call.argument("targetOrigin");
+          List<WebMessagePortCompat> ports = new ArrayList<>();
+          List<Map<String, Object>> portsMap = (List<Map<String, Object>>) message.get("ports");
+          if (portsMap != null) {
+            for (Map<String, Object> portMap : portsMap) {
+              String webMessageChannelId = (String) portMap.get("webMessageChannelId");
+              Integer index = (Integer) portMap.get("index");
+              WebMessageChannel webMessageChannel = webView.webMessageChannels.get(webMessageChannelId);
+              if (webMessageChannel != null) {
+                ports.add(webMessageChannel.ports.get(index));
+              }
+            }
+          }
+          WebMessageCompat webMessage = new WebMessageCompat((String) message.get("data"), ports.toArray(new WebMessagePortCompat[0]));
+          try {
+            WebViewCompat.postWebMessage(webView, webMessage, Uri.parse(targetOrigin));
+            result.success(true);
+          } catch (Exception e) {
+            result.error(LOG_TAG, e.getMessage(), null);
+          }
+        } else {
+          result.success(true);
+        }
+        break;
+      case "addWebMessageListener":
+        if (webView != null && WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+          Map<String, Object> webMessageListenerMap = (Map<String, Object>) call.argument("webMessageListener");
+          WebMessageListener webMessageListener = WebMessageListener.fromMap(webView.plugin.messenger, webMessageListenerMap);
+          try {
+            webView.addWebMessageListener(webMessageListener);
+            result.success(true);
+          } catch (Exception e) {
+            result.error(LOG_TAG, e.getMessage(), null);
+          }
+        } else {
+          result.success(true);
+        }
+        break;
+      case "canScrollVertically":
+        if (webView != null) {
+          result.success(webView.canScrollVertically());
+        } else {
+          result.success(false);
+        }
+        break;
+      case "canScrollHorizontally":
+        if (webView != null) {
+          result.success(webView.canScrollHorizontally());
+        } else {
+          result.success(false);
         }
         break;
       default:

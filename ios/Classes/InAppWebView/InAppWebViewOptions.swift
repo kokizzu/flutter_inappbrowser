@@ -67,6 +67,8 @@ public class InAppWebViewOptions: Options<InAppWebView> {
     var limitsNavigationsToAppBoundDomains = false
     var useOnNavigationResponse = false
     var applePayAPIEnabled = false
+    var allowingReadAccessTo: String? = nil
+    var disableLongPressContextMenuOnLinks = false
     
     override init(){
         super.init()
@@ -95,7 +97,7 @@ public class InAppWebViewOptions: Options<InAppWebView> {
             if #available(iOS 10.0, *) {
                 realOptions["mediaPlaybackRequiresUserGesture"] = configuration.mediaTypesRequiringUserActionForPlayback == .all
                 realOptions["ignoresViewportScaleLimits"] = configuration.ignoresViewportScaleLimits
-                realOptions["dataDetectorTypes"] = InAppWebView.getDataDetectorTypeString(type: configuration.dataDetectorTypes)
+                realOptions["dataDetectorTypes"] = Util.getDataDetectorTypeString(type: configuration.dataDetectorTypes)
             } else {
                 realOptions["mediaPlaybackRequiresUserGesture"] = configuration.mediaPlaybackRequiresUserAction
             }
@@ -113,7 +115,7 @@ public class InAppWebViewOptions: Options<InAppWebView> {
                 realOptions["accessibilityIgnoresInvertColors"] = webView.accessibilityIgnoresInvertColors
                 realOptions["contentInsetAdjustmentBehavior"] = webView.scrollView.contentInsetAdjustmentBehavior.rawValue
             }
-            realOptions["decelerationRate"] = InAppWebView.getDecelerationRateString(type: webView.scrollView.decelerationRate)
+            realOptions["decelerationRate"] = Util.getDecelerationRateString(type: webView.scrollView.decelerationRate)
             realOptions["alwaysBounceVertical"] = webView.scrollView.alwaysBounceVertical
             realOptions["alwaysBounceHorizontal"] = webView.scrollView.alwaysBounceHorizontal
             realOptions["scrollsToTop"] = webView.scrollView.scrollsToTop

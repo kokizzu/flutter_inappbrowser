@@ -1,22 +1,24 @@
+import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:ui';
 
-import 'X509Certificate/x509_certificate.dart';
-import 'package:uuid/uuid.dart';
 import 'package:flutter/foundation.dart';
 
-import 'in_app_browser.dart';
-import 'webview.dart';
-import 'webview_options.dart';
-import 'in_app_webview_controller.dart';
-import 'http_auth_credentials_database.dart';
-import 'chrome_safari_browser.dart';
-import 'cookie_manager.dart';
-import 'web_storage_manager.dart';
-import 'web_storage.dart';
+import 'x509_certificate/x509_certificate.dart';
+import 'x509_certificate/asn1_distinguished_names.dart';
 
-var uuidGenerator = new Uuid();
+import 'in_app_webview/webview.dart';
+import 'in_app_webview/in_app_webview_controller.dart';
+import 'http_auth_credentials_database.dart';
+import 'cookie_manager.dart';
+import 'web_storage/web_storage.dart';
+import 'pull_to_refresh/pull_to_refresh_controller.dart';
+import 'pull_to_refresh/pull_to_refresh_options.dart';
+import 'util.dart';
+import 'web_message/web_message_listener.dart';
+import 'web_message/web_message_channel.dart';
 
 ///This type represents a callback, added with [InAppWebViewController.addJavaScriptHandler], that listens to post messages sent from JavaScript.
 ///
@@ -29,6 +31,14 @@ var uuidGenerator = new Uuid();
 ///Also, a [JavaScriptHandlerCallback] can return json data to the JavaScript side.
 ///In this case, simply return data that you want to send and it will be automatically json encoded using [jsonEncode] from the `dart:convert` library.
 typedef dynamic JavaScriptHandlerCallback(List<dynamic> arguments);
+
+///The listener for handling [WebMessageListener] events sent by a `postMessage()` on the injected JavaScript object.
+typedef void OnPostMessageCallback(String? message, Uri? sourceOrigin,
+    bool isMainFrame, JavaScriptReplyProxy replyProxy);
+
+///The listener for handling [WebMessagePort] events.
+///The message callback methods are called on the main thread.
+typedef void WebMessageCallback(String? message);
 
 ///Class representing the level of a console message.
 class ConsoleMessageLevel {
@@ -47,8 +57,8 @@ class ConsoleMessageLevel {
   static ConsoleMessageLevel? fromValue(int? value) {
     if (value != null) {
       try {
-        return ConsoleMessageLevel.values.firstWhere(
-                (element) => element.toValue() == value);
+        return ConsoleMessageLevel.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -94,7 +104,7 @@ class LoadedResource {
   String? initiatorType;
 
   ///Resource URL.
-  String? url;
+  Uri? url;
 
   ///Returns the [DOMHighResTimeStamp](https://developer.mozilla.org/en-US/docs/Web/API/DOMHighResTimeStamp) for the time a resource fetch started.
   double? startTime;
@@ -104,10 +114,21 @@ class LoadedResource {
 
   LoadedResource({this.initiatorType, this.url, this.startTime, this.duration});
 
+  static LoadedResource? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return LoadedResource(
+        initiatorType: map["initiatorType"],
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        startTime: map["startTime"],
+        duration: map["duration"]);
+  }
+
   Map<String, dynamic> toMap() {
     return {
       "initiatorType": initiatorType,
-      "url": url,
+      "url": url?.toString(),
       "startTime": startTime,
       "duration": duration
     };
@@ -135,25 +156,32 @@ class InAppWebViewInitialData {
   String encoding;
 
   ///The URL to use as the page's base URL. The default value is `about:blank`.
-  String baseUrl;
+  late Uri baseUrl;
 
-  ///The URL to use as the history entry. The default value is `about:blank`. If non-null, this must be a valid URL. This parameter is used only on Android.
-  String historyUrl;
+  ///The URL to use as the history entry. The default value is `about:blank`. If non-null, this must be a valid URL.
+  ///
+  ///This parameter is used only on Android.
+  late Uri androidHistoryUrl;
 
   InAppWebViewInitialData(
       {required this.data,
       this.mimeType = "text/html",
       this.encoding = "utf8",
-      this.baseUrl = "about:blank",
-      this.historyUrl = "about:blank"});
+      Uri? baseUrl,
+      Uri? androidHistoryUrl}) {
+    this.baseUrl = baseUrl == null ? Uri.parse("about:blank") : baseUrl;
+    this.androidHistoryUrl = androidHistoryUrl == null
+        ? Uri.parse("about:blank")
+        : androidHistoryUrl;
+  }
 
   Map<String, String> toMap() {
     return {
       "data": data,
       "mimeType": mimeType,
       "encoding": encoding,
-      "baseUrl": baseUrl,
-      "historyUrl": historyUrl
+      "baseUrl": baseUrl.toString(),
+      "historyUrl": androidHistoryUrl.toString()
     };
   }
 
@@ -173,7 +201,7 @@ class InAppWebViewInitialData {
 ///**Official Android API**: https://developer.android.com/reference/android/webkit/WebResourceRequest
 class WebResourceRequest {
   ///The URL for which the resource request was made.
-  String url;
+  Uri url;
 
   ///The headers associated with the request.
   ///
@@ -206,14 +234,28 @@ class WebResourceRequest {
   WebResourceRequest(
       {required this.url,
       this.headers,
-        required this.method,
-        required this.hasGesture,
-        required this.isForMainFrame,
-        required this.isRedirect});
+      required this.method,
+      required this.hasGesture,
+      required this.isForMainFrame,
+      required this.isRedirect});
+
+  static WebResourceRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    return WebResourceRequest(
+        url: Uri.parse(map["url"]),
+        headers: map["headers"]?.cast<String, String>(),
+        method: map["method"],
+        hasGesture: map["hasGesture"],
+        isForMainFrame: map["isForMainFrame"],
+        isRedirect: map["isRedirect"]);
+  }
 
   Map<String, dynamic> toMap() {
     return {
-      "url": url,
+      "url": url.toString(),
       "headers": headers,
       "method": method,
       "hasGesture": hasGesture,
@@ -301,18 +343,18 @@ class CustomSchemeResponse {
   ///Content-Type of the data, such as `image/png`.
   String contentType;
 
-  ///Content-Enconding of the data, such as `utf-8`.
-  String contentEnconding;
+  ///Content-Encoding of the data, such as `utf-8`.
+  String contentEncoding;
 
   CustomSchemeResponse(
       {required this.data,
       required this.contentType,
-      this.contentEnconding = 'utf-8'});
+      this.contentEncoding = 'utf-8'});
 
   Map<String, dynamic> toMap() {
     return {
-      'content-type': contentType,
-      'content-encoding': contentEnconding,
+      'contentType': contentType,
+      'contentEncoding': contentEncoding,
       'data': data
     };
   }
@@ -333,13 +375,24 @@ class CustomSchemeResponse {
 ///To receive notifications of these messages, use the [WebView.onConsoleMessage] event.
 class ConsoleMessage {
   String message;
-  ConsoleMessageLevel? messageLevel;
+  ConsoleMessageLevel messageLevel;
 
   ConsoleMessage(
       {this.message = "", this.messageLevel = ConsoleMessageLevel.LOG});
 
+  static ConsoleMessage? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return ConsoleMessage(
+      message: map["message"],
+      messageLevel: ConsoleMessageLevel.fromValue(map["messageLevel"]) ??
+          ConsoleMessageLevel.LOG,
+    );
+  }
+
   Map<String, dynamic> toMap() {
-    return {"message": message, "messageLevel": messageLevel?.toValue()};
+    return {"message": message, "messageLevel": messageLevel.toValue()};
   }
 
   Map<String, dynamic> toJson() {
@@ -362,6 +415,35 @@ class WebHistory {
 
   WebHistory({this.list, this.currentIndex});
 
+  static WebHistory? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    List<LinkedHashMap<dynamic, dynamic>>? historyListMap =
+        map["history"]?.cast<LinkedHashMap<dynamic, dynamic>>();
+    int currentIndex = map["currentIndex"];
+
+    List<WebHistoryItem> historyList = <WebHistoryItem>[];
+    if (historyListMap != null) {
+      for (var i = 0; i < historyListMap.length; i++) {
+        var historyItem = historyListMap[i];
+        historyList.add(WebHistoryItem(
+            originalUrl: historyItem["originalUrl"] != null
+                ? Uri.parse(historyItem["originalUrl"])
+                : null,
+            title: historyItem["title"],
+            url: historyItem["url"] != null
+                ? Uri.parse(historyItem["url"])
+                : null,
+            index: i,
+            offset: i - currentIndex));
+      }
+    }
+
+    return WebHistory(list: historyList, currentIndex: currentIndex);
+  }
+
   Map<String, dynamic> toMap() {
     return {"list": list, "currentIndex": currentIndex};
   }
@@ -379,13 +461,13 @@ class WebHistory {
 ///A convenience class for accessing fields in an entry in the back/forward list of a WebView. Each [WebHistoryItem] is a snapshot of the requested history item.
 class WebHistoryItem {
   ///Original url of this history item.
-  String? originalUrl;
+  Uri? originalUrl;
 
   ///Document title of this history item.
   String? title;
 
   ///Url of this history item.
-  String? url;
+  Uri? url;
 
   ///0-based position index in the back-forward [WebHistory.list].
   int? index;
@@ -398,9 +480,9 @@ class WebHistoryItem {
 
   Map<String, dynamic> toMap() {
     return {
-      "originalUrl": originalUrl,
+      "originalUrl": originalUrl?.toString(),
       "title": title,
-      "url": url,
+      "url": url?.toString(),
       "index": index,
       "offset": offset
     };
@@ -447,7 +529,7 @@ class GeolocationPermissionShowPromptResponse {
 ///Class that represents the request of the [WebView.onJsAlert] event.
 class JsAlertRequest {
   ///The url of the page requesting the dialog.
-  String? url;
+  Uri? url;
 
   ///Message to be displayed in the window.
   String? message;
@@ -460,7 +542,21 @@ class JsAlertRequest {
   JsAlertRequest({this.url, this.message, this.iosIsMainFrame});
 
   Map<String, dynamic> toMap() {
-    return {"url": url, "message": message, "iosIsMainFrame": iosIsMainFrame};
+    return {
+      "url": url?.toString(),
+      "message": message,
+      "iosIsMainFrame": iosIsMainFrame
+    };
+  }
+
+  static JsAlertRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return JsAlertRequest(
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        message: map["message"],
+        iosIsMainFrame: map["iosIsMainFrame"]);
   }
 
   Map<String, dynamic> toJson() {
@@ -531,7 +627,7 @@ class JsAlertResponse {
 ///Class that represents the request of the [WebView.onJsConfirm] event.
 class JsConfirmRequest {
   ///The url of the page requesting the dialog.
-  String? url;
+  Uri? url;
 
   ///Message to be displayed in the window.
   String? message;
@@ -544,7 +640,21 @@ class JsConfirmRequest {
   JsConfirmRequest({this.url, this.message, this.iosIsMainFrame});
 
   Map<String, dynamic> toMap() {
-    return {"url": url, "message": message, "iosIsMainFrame": iosIsMainFrame};
+    return {
+      "url": url?.toString(),
+      "message": message,
+      "iosIsMainFrame": iosIsMainFrame
+    };
+  }
+
+  static JsConfirmRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return JsConfirmRequest(
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        message: map["message"],
+        iosIsMainFrame: map["iosIsMainFrame"]);
   }
 
   Map<String, dynamic> toJson() {
@@ -621,7 +731,7 @@ class JsConfirmResponse {
 ///Class that represents the request of the [WebView.onJsPrompt] event.
 class JsPromptRequest {
   ///The url of the page requesting the dialog.
-  String? url;
+  Uri? url;
 
   ///Message to be displayed in the window.
   String? message;
@@ -639,11 +749,22 @@ class JsPromptRequest {
 
   Map<String, dynamic> toMap() {
     return {
-      "url": url,
+      "url": url?.toString(),
       "message": message,
       "defaultValue": defaultValue,
       "iosIsMainFrame": iosIsMainFrame
     };
+  }
+
+  static JsPromptRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return JsPromptRequest(
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        message: map["message"],
+        defaultValue: map["defaultValue"],
+        iosIsMainFrame: map["iosIsMainFrame"]);
   }
 
   Map<String, dynamic> toJson() {
@@ -730,20 +851,25 @@ class JsPromptResponse {
 ///Class that represents the request of the [WebView.androidOnJsBeforeUnload] event.
 class JsBeforeUnloadRequest {
   ///The url of the page requesting the dialog.
-  String? url;
+  Uri? url;
 
   ///Message to be displayed in the window.
   String? message;
 
-  ///Indicates whether the request was made for the main frame.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosIsMainFrame;
+  JsBeforeUnloadRequest({this.url, this.message});
 
-  JsBeforeUnloadRequest({this.url, this.message, this.iosIsMainFrame});
+  static JsBeforeUnloadRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return JsBeforeUnloadRequest(
+      url: map["url"] != null ? Uri.parse(map["url"]) : null,
+      message: map["message"],
+    );
+  }
 
   Map<String, dynamic> toMap() {
-    return {"url": url, "message": message, "iosIsMainFrame": iosIsMainFrame};
+    return {"url": url?.toString(), "message": message};
   }
 
   Map<String, dynamic> toJson() {
@@ -834,8 +960,8 @@ class SafeBrowsingThreat {
   static SafeBrowsingThreat? fromValue(int? value) {
     if (value != null) {
       try {
-        return SafeBrowsingThreat.values.firstWhere(
-                (element) => element.toValue() == value);
+        return SafeBrowsingThreat.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -993,22 +1119,430 @@ class HttpAuthResponse {
   }
 }
 
-///Class that represents the challenge of the [WebView.onReceivedHttpAuthRequest] event.
-///It provides all the information about the challenge.
-class URLAuthenticationChallenge {
-  ///A count of previous failed authentication attempts.
-  int previousFailureCount;
+///An iOS-specific class that represents the constants that specify how long the credential will be kept.
+class IOSURLCredentialPersistence {
+  final int _value;
 
-  ///The protection space requiring authentication.
-  ProtectionSpace? protectionSpace;
+  const IOSURLCredentialPersistence._internal(this._value);
 
-  URLAuthenticationChallenge(
-      {required this.previousFailureCount, required this.protectionSpace});
+  static final Set<IOSURLCredentialPersistence> values = [
+    IOSURLCredentialPersistence.NONE,
+    IOSURLCredentialPersistence.FOR_SESSION,
+    IOSURLCredentialPersistence.PERMANENT,
+    IOSURLCredentialPersistence.SYNCHRONIZABLE,
+  ].toSet();
+
+  static IOSURLCredentialPersistence? fromValue(int? value) {
+    if (value != null) {
+      try {
+        return IOSURLCredentialPersistence.values
+            .firstWhere((element) => element.toValue() == value);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  int toValue() => _value;
+
+  String toString() {
+    switch (_value) {
+      case 1:
+        return "FOR_SESSION";
+      case 2:
+        return "PERMANENT";
+      case 3:
+        return "SYNCHRONIZABLE";
+      case 0:
+      default:
+        return "NONE";
+    }
+  }
+
+  ///The credential should not be stored.
+  static const NONE = const IOSURLCredentialPersistence._internal(0);
+
+  ///The credential should be stored only for this session
+  static const FOR_SESSION = const IOSURLCredentialPersistence._internal(1);
+
+  ///The credential should be stored in the keychain.
+  static const PERMANENT = const IOSURLCredentialPersistence._internal(2);
+
+  ///The credential should be stored permanently in the keychain,
+  ///and in addition should be distributed to other devices based on the owning Apple ID.
+  static const SYNCHRONIZABLE = const IOSURLCredentialPersistence._internal(3);
+
+  bool operator ==(value) => value == _value;
+
+  @override
+  int get hashCode => _value.hashCode;
+}
+
+///Class that represents an authentication credential consisting of information
+///specific to the type of credential and the type of persistent storage to use, if any.
+class URLCredential {
+  ///The credential’s user name.
+  String? username;
+
+  ///The credential’s password.
+  String? password;
+
+  ///The intermediate certificates of the credential, if it is a client certificate credential.
+  ///
+  ///**NOTE**: available only on iOS.
+  List<X509Certificate>? iosCertificates;
+
+  ///The credential’s persistence setting.
+  ///
+  ///**NOTE**: available only on iOS.
+  IOSURLCredentialPersistence? iosPersistence;
+
+  URLCredential(
+      {this.username,
+      this.password,
+      this.iosPersistence,
+      this.iosCertificates});
 
   Map<String, dynamic> toMap() {
     return {
+      "username": username,
+      "password": password,
+      "iosCertificates": iosCertificates?.map((e) => e.toMap()).toList(),
+      "iosPersistence": iosPersistence?.toValue(),
+    };
+  }
+
+  static URLCredential? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    List<X509Certificate>? iosCertificates;
+    if (map["iosCertificates"] != null) {
+      iosCertificates = <X509Certificate>[];
+      (map["iosCertificates"].cast<Uint8List>() as List<Uint8List>)
+          .forEach((data) {
+        try {
+          iosCertificates!.add(X509Certificate.fromData(data: data));
+        } catch (e, stacktrace) {
+          print(e);
+          print(stacktrace);
+        }
+      });
+    }
+
+    return URLCredential(
+      username: map["user"],
+      password: map["password"],
+      iosCertificates: iosCertificates,
+      iosPersistence:
+          IOSURLCredentialPersistence.fromValue(map["iosPersistence"]),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///Class that represents a challenge from a server requiring authentication from the client.
+///It provides all the information about the challenge.
+class URLAuthenticationChallenge {
+  ///The protection space requiring authentication.
+  URLProtectionSpace protectionSpace;
+
+  URLAuthenticationChallenge({
+    required this.protectionSpace,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      "protectionSpace": protectionSpace.toMap(),
+    };
+  }
+
+  static URLAuthenticationChallenge? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return URLAuthenticationChallenge(
+      protectionSpace: URLProtectionSpace.fromMap(
+          map["protectionSpace"].cast<String, dynamic>())!,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///Class that represents the challenge of the [WebView.onReceivedHttpAuthRequest] event.
+///It provides all the information about the challenge.
+class HttpAuthenticationChallenge extends URLAuthenticationChallenge {
+  ///A count of previous failed authentication attempts.
+  int previousFailureCount;
+
+  ///The proposed credential for this challenge.
+  ///This method returns `null` if there is no default credential for this challenge.
+  ///If you have previously attempted to authenticate and failed, this method returns the most recent failed credential.
+  ///If the proposed credential is not nil and returns true when you call its hasPassword method, then the credential is ready to use as-is.
+  ///If the proposed credential’s hasPassword method returns false, then the credential provides a default user name,
+  ///and the client must prompt the user for a corresponding password.
+  URLCredential? proposedCredential;
+
+  ///The URL response object representing the last authentication failure.
+  ///This value is `null` if the protocol doesn’t use responses to indicate an authentication failure.
+  ///
+  ///**NOTE**: available only on iOS.
+  IOSURLResponse? iosFailureResponse;
+
+  ///The error object representing the last authentication failure.
+  ///This value is `null` if the protocol doesn’t use errors to indicate an authentication failure.
+  ///
+  ///**NOTE**: available only on iOS.
+  String? iosError;
+
+  HttpAuthenticationChallenge({
+    required this.previousFailureCount,
+    required URLProtectionSpace protectionSpace,
+    this.iosFailureResponse,
+    this.proposedCredential,
+    this.iosError,
+  }) : super(protectionSpace: protectionSpace);
+
+  Map<String, dynamic> toMap() {
+    var map = super.toMap();
+    map.addAll({
       "previousFailureCount": previousFailureCount,
-      "protectionSpace": protectionSpace?.toMap()
+      "protectionSpace": protectionSpace.toMap(),
+      "proposedCredential": proposedCredential?.toMap(),
+      "iosFailureResponse": iosFailureResponse?.toMap(),
+      "iosError": iosError,
+    });
+    return map;
+  }
+
+  static HttpAuthenticationChallenge? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return HttpAuthenticationChallenge(
+      previousFailureCount: map["previousFailureCount"],
+      protectionSpace: URLProtectionSpace.fromMap(
+          map["protectionSpace"].cast<String, dynamic>())!,
+      proposedCredential: URLCredential.fromMap(
+          map["proposedCredential"]?.cast<String, dynamic>()),
+      iosFailureResponse: IOSURLResponse.fromMap(
+          map["iosFailureResponse"]?.cast<String, dynamic>()),
+      iosError: map["iosError"],
+    );
+  }
+}
+
+///Class that represents the challenge of the [WebView.onReceivedServerTrustAuthRequest] event.
+///It provides all the information about the challenge.
+class ServerTrustChallenge extends URLAuthenticationChallenge {
+  ServerTrustChallenge({required URLProtectionSpace protectionSpace})
+      : super(protectionSpace: protectionSpace);
+
+  static ServerTrustChallenge? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return ServerTrustChallenge(
+      protectionSpace: URLProtectionSpace.fromMap(
+          map["protectionSpace"].cast<String, dynamic>())!,
+    );
+  }
+}
+
+///Class that represents the challenge of the [WebView.onReceivedClientCertRequest] event.
+///It provides all the information about the challenge.
+class ClientCertChallenge extends URLAuthenticationChallenge {
+  ///The acceptable certificate issuers for the certificate matching the private key.
+  ///
+  ///**NOTE**: available only on Android.
+  List<String>? androidPrincipals;
+
+  ///Returns the acceptable types of asymmetric keys.
+  ///
+  ///**NOTE**: available only on Android.
+  List<String>? androidKeyTypes;
+
+  ClientCertChallenge(
+      {required URLProtectionSpace protectionSpace,
+      this.androidPrincipals,
+      this.androidKeyTypes})
+      : super(protectionSpace: protectionSpace);
+
+  static ClientCertChallenge? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return ClientCertChallenge(
+        protectionSpace: URLProtectionSpace.fromMap(
+            map["protectionSpace"].cast<String, dynamic>())!,
+        androidPrincipals: map["androidPrincipals"]?.cast<String>(),
+        androidKeyTypes: map["androidKeyTypes"]?.cast<String>());
+  }
+}
+
+///An iOS-specific Class that represents the supported proxy types.
+class IOSNSURLProtectionSpaceProxyType {
+  final String _value;
+
+  const IOSNSURLProtectionSpaceProxyType._internal(this._value);
+
+  static final Set<IOSNSURLProtectionSpaceProxyType> values = [
+    IOSNSURLProtectionSpaceProxyType.NSUR_PROTECTION_SPACE_HTTP_PROXY,
+    IOSNSURLProtectionSpaceProxyType.NSURL_PROTECTION_SPACE_HTTPS_PROXY,
+    IOSNSURLProtectionSpaceProxyType.NSURL_PROTECTION_SPACE_FTP_PROXY,
+    IOSNSURLProtectionSpaceProxyType.NSURL_PROTECTION_SPACE_SOCKS_PROXY,
+  ].toSet();
+
+  static IOSNSURLProtectionSpaceProxyType? fromValue(String? value) {
+    if (value != null) {
+      try {
+        return IOSNSURLProtectionSpaceProxyType.values
+            .firstWhere((element) => element.toValue() == value);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  String toValue() => _value;
+
+  @override
+  String toString() => _value;
+
+  ///The proxy type for HTTP proxies.
+  static const NSUR_PROTECTION_SPACE_HTTP_PROXY =
+      const IOSNSURLProtectionSpaceProxyType._internal(
+          "NSURLProtectionSpaceHTTPProxy");
+
+  ///The proxy type for HTTPS proxies.
+  static const NSURL_PROTECTION_SPACE_HTTPS_PROXY =
+      const IOSNSURLProtectionSpaceProxyType._internal(
+          "NSURLProtectionSpaceHTTPSProxy");
+
+  ///The proxy type for FTP proxies.
+  static const NSURL_PROTECTION_SPACE_FTP_PROXY =
+      const IOSNSURLProtectionSpaceProxyType._internal(
+          "NSURLProtectionSpaceFTPProxy");
+
+  ///The proxy type for SOCKS proxies.
+  static const NSURL_PROTECTION_SPACE_SOCKS_PROXY =
+      const IOSNSURLProtectionSpaceProxyType._internal(
+          "NSURLProtectionSpaceSOCKSProxy");
+
+  bool operator ==(value) => value == _value;
+
+  @override
+  int get hashCode => _value.hashCode;
+}
+
+///An iOS-specific Class that represents the constants describing known values of the [URLProtectionSpace.iosAuthenticationMethod] property.
+class IOSNSURLProtectionSpaceAuthenticationMethod {
+  final String _value;
+
+  const IOSNSURLProtectionSpaceAuthenticationMethod._internal(this._value);
+
+  static final Set<IOSNSURLProtectionSpaceAuthenticationMethod> values = [
+    IOSNSURLProtectionSpaceAuthenticationMethod
+        .NSURL_AUTHENTICATION_METHOD_CLIENT_CERTIFICATE,
+    IOSNSURLProtectionSpaceAuthenticationMethod
+        .NSURL_AUTHENTICATION_METHOD_NEGOTIATE,
+    IOSNSURLProtectionSpaceAuthenticationMethod
+        .NSURL_AUTHENTICATION_METHOD_NTLM,
+    IOSNSURLProtectionSpaceAuthenticationMethod
+        .NSURL_AUTHENTICATION_METHOD_SERVER_TRUST,
+  ].toSet();
+
+  static IOSNSURLProtectionSpaceAuthenticationMethod? fromValue(String? value) {
+    if (value != null) {
+      try {
+        return IOSNSURLProtectionSpaceAuthenticationMethod.values
+            .firstWhere((element) => element.toValue() == value);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  String toValue() => _value;
+
+  @override
+  String toString() => _value;
+
+  ///Use client certificate authentication for this protection space.
+  static const NSURL_AUTHENTICATION_METHOD_CLIENT_CERTIFICATE =
+      const IOSNSURLProtectionSpaceAuthenticationMethod._internal(
+          "NSURLAuthenticationMethodClientCertificate");
+
+  ///Negotiate whether to use Kerberos or NTLM authentication for this protection space.
+  static const NSURL_AUTHENTICATION_METHOD_NEGOTIATE =
+      const IOSNSURLProtectionSpaceAuthenticationMethod._internal(
+          "NSURLAuthenticationMethodNegotiate");
+
+  ///Use NTLM authentication for this protection space.
+  static const NSURL_AUTHENTICATION_METHOD_NTLM =
+      const IOSNSURLProtectionSpaceAuthenticationMethod._internal(
+          "NSURLAuthenticationMethodNTLM");
+
+  ///Perform server trust authentication (certificate validation) for this protection space.
+  static const NSURL_AUTHENTICATION_METHOD_SERVER_TRUST =
+      const IOSNSURLProtectionSpaceAuthenticationMethod._internal(
+          "NSURLAuthenticationMethodServerTrust");
+
+  bool operator ==(value) => value == _value;
+
+  @override
+  int get hashCode => _value.hashCode;
+}
+
+///Class that represents an SSL Error.
+class SslError {
+  ///Android-specific primary error associated to the server SSL certificate.
+  AndroidSslError? androidError;
+
+  ///iOS-specific primary error associated to the server SSL certificate.
+  IOSSslError? iosError;
+
+  ///The message associated to the [androidError]/[iosError].
+  String? message;
+
+  SslError({this.androidError, this.iosError, this.message});
+
+  static SslError? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return SslError(
+        androidError: AndroidSslError.fromValue(map["androidError"]),
+        iosError: IOSSslError.fromValue(map["iosError"]),
+        message: map["message"]);
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      "androidError": androidError?.toValue(),
+      "iosError": iosError?.toValue(),
+      "message": message,
     };
   }
 
@@ -1023,12 +1557,12 @@ class URLAuthenticationChallenge {
 }
 
 ///Class that represents a protection space requiring authentication.
-class ProtectionSpace {
+class URLProtectionSpace {
   ///The hostname of the server.
   String host;
 
   ///The protocol of the server - e.g. "http", "ftp", "https".
-  String protocol;
+  String? protocol;
 
   ///A string indicating a protocol-specific subdivision of a single host.
   ///For http and https, this maps to the realm string in http authentication challenges.
@@ -1038,11 +1572,107 @@ class ProtectionSpace {
   ///The port of the server.
   int? port;
 
-  ProtectionSpace(
-      {required this.host, required this.protocol, this.realm, this.port});
+  ///The SSL certificate used.
+  SslCertificate? sslCertificate;
+
+  ///The SSL Error associated.
+  SslError? sslError;
+
+  ///The authentication method used by the receiver.
+  ///
+  ///**NOTE**: available only on iOS.
+  IOSNSURLProtectionSpaceAuthenticationMethod? iosAuthenticationMethod;
+
+  ///The acceptable certificate-issuing authorities for client certificate authentication.
+  ///This value is `null` if the authentication method of the protection space is not client certificate.
+  ///The returned issuing authorities are encoded with Distinguished Encoding Rules (DER).
+  ///
+  ///**NOTE**: available only on iOS.
+  List<X509Certificate>? iosDistinguishedNames;
+
+  ///A Boolean value that indicates whether the credentials for the protection space can be sent securely.
+  ///This value is `true` if the credentials for the protection space represented by the receiver can be sent securely, `false` otherwise.
+  ///
+  ///**NOTE**: available only on iOS.
+  bool? iosReceivesCredentialSecurely;
+
+  ///Returns a Boolean value that indicates whether the receiver does not descend from `NSObject`.
+  ///
+  ///**NOTE**: available only on iOS.
+  bool? iosIsProxy;
+
+  ///The receiver's proxy type.
+  ///This value is `null` if the receiver does not represent a proxy protection space.
+  ///The supported proxy types are listed in [IOSNSURLProtectionSpaceProxyType.values].
+  ///
+  ///**NOTE**: available only on iOS.
+  IOSNSURLProtectionSpaceProxyType? iosProxyType;
+
+  URLProtectionSpace(
+      {required this.host,
+      this.protocol,
+      this.realm,
+      this.port,
+      this.sslCertificate,
+      this.sslError,
+      this.iosAuthenticationMethod,
+      this.iosDistinguishedNames,
+      this.iosReceivesCredentialSecurely,
+      this.iosIsProxy,
+      this.iosProxyType});
+
+  static URLProtectionSpace? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    List<X509Certificate>? iosDistinguishedNames;
+    if (map["iosDistinguishedNames"] != null) {
+      iosDistinguishedNames = <X509Certificate>[];
+      (map["iosDistinguishedNames"].cast<Uint8List>() as List<Uint8List>)
+          .forEach((data) {
+        try {
+          iosDistinguishedNames!.add(X509Certificate.fromData(data: data));
+        } catch (e, stacktrace) {
+          print(e);
+          print(stacktrace);
+        }
+      });
+    }
+
+    return URLProtectionSpace(
+      host: map["host"],
+      protocol: map["protocol"],
+      realm: map["realm"],
+      port: map["port"],
+      sslCertificate: SslCertificate.fromMap(
+          map["sslCertificate"]?.cast<String, dynamic>()),
+      sslError: SslError.fromMap(map["sslError"]?.cast<String, dynamic>()),
+      iosAuthenticationMethod:
+          IOSNSURLProtectionSpaceAuthenticationMethod.fromValue(
+              map["iosAuthenticationMethod"]),
+      iosDistinguishedNames: iosDistinguishedNames,
+      iosReceivesCredentialSecurely: map["iosReceivesCredentialSecurely"],
+      iosIsProxy: map["iosIsProxy"],
+      iosProxyType:
+          IOSNSURLProtectionSpaceProxyType.fromValue(map["iosProxyType"]),
+    );
+  }
 
   Map<String, dynamic> toMap() {
-    return {"host": host, "protocol": protocol, "realm": realm, "port": port};
+    return {
+      "host": host,
+      "protocol": protocol,
+      "realm": realm,
+      "port": port,
+      "sslCertificate": sslCertificate?.toMap(),
+      "sslError": sslError?.toMap(),
+      "iosAuthenticationMethod": iosAuthenticationMethod,
+      "iosDistinguishedNames":
+          iosDistinguishedNames?.map((e) => e.toMap()).toList(),
+      "iosReceivesCredentialSecurely": iosReceivesCredentialSecurely,
+      "iosIsProxy": iosIsProxy,
+      "iosProxyType": iosProxyType?.toValue()
+    };
   }
 
   Map<String, dynamic> toJson() {
@@ -1055,47 +1685,52 @@ class ProtectionSpace {
   }
 }
 
-///Class that represents the credentials of an http authentication.
-///It is used by the [HttpAuthCredentialDatabase] class.
-class HttpAuthCredential {
-  ///Represents the username.
-  String username;
-
-  ///Represents the password.
-  String password;
-
-  HttpAuthCredential({required this.username, required this.password});
-
-  Map<String, dynamic> toMap() {
-    return {"username": username, "password": password};
-  }
-
-  Map<String, dynamic> toJson() {
-    return this.toMap();
-  }
-
-  @override
-  String toString() {
-    return toMap().toString();
-  }
-}
-
-///Class that represents a [ProtectionSpace] with all of its [HttpAuthCredential]s.
+///Class that represents a [URLProtectionSpace] with all of its [HttpAuthCredential]s.
 ///It used by [HttpAuthCredentialDatabase.getAllAuthCredentials].
-class ProtectionSpaceHttpAuthCredentials {
+class URLProtectionSpaceHttpAuthCredentials {
   ///The protection space.
-  ProtectionSpace? protectionSpace;
+  URLProtectionSpace? protectionSpace;
 
   ///The list of all its http authentication credentials.
-  List<HttpAuthCredential>? credentials;
+  List<URLCredential>? credentials;
 
-  ProtectionSpaceHttpAuthCredentials({this.protectionSpace, this.credentials});
+  URLProtectionSpaceHttpAuthCredentials(
+      {this.protectionSpace, this.credentials});
+
+  static URLProtectionSpaceHttpAuthCredentials? fromMap(
+      Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    List<URLCredential>? credentials;
+    if (map["credentials"] != null) {
+      credentials = <URLCredential>[];
+      (map["credentials"].cast<Map<String, dynamic>>()
+              as List<Map<String, dynamic>>)
+          .forEach((element) {
+        var credential = URLCredential.fromMap(element);
+        if (credential != null) {
+          credentials!.add(credential);
+        }
+      });
+    }
+
+    return URLProtectionSpaceHttpAuthCredentials(
+      protectionSpace: map["protectionSpace"] != null
+          ? URLProtectionSpace.fromMap(
+              map["protectionSpace"]?.cast<String, dynamic>())
+          : null,
+      credentials: credentials,
+    );
+  }
 
   Map<String, dynamic> toMap() {
     return {
       "protectionSpace": protectionSpace?.toMap(),
-      "credentials": credentials != null ?
-          credentials!.map((credential) => credential.toMap()).toList() : null
+      "credentials": credentials != null
+          ? credentials!.map((credential) => credential.toMap()).toList()
+          : null
     };
   }
 
@@ -1138,52 +1773,6 @@ class ServerTrustAuthResponse {
 
   Map<String, dynamic> toMap() {
     return {"action": action?.toValue()};
-  }
-
-  Map<String, dynamic> toJson() {
-    return this.toMap();
-  }
-
-  @override
-  String toString() {
-    return toMap().toString();
-  }
-}
-
-///Class that represents the challenge of the [WebView.onReceivedServerTrustAuthRequest] event.
-///It provides all the information about the challenge.
-class ServerTrustChallenge {
-  ///The protection space requiring authentication.
-  ProtectionSpace? protectionSpace;
-
-  ///Android-specific primary error associated to the server SSL certificate.
-  AndroidSslError? androidError;
-
-  ///iOS-specific primary error associated to the server SSL certificate.
-  IOSSslError? iosError;
-
-  ///The message associated to the [androidError]/[iosError].
-  String? message;
-
-  ///The SSL certificate used for this challenge.
-  SslCertificate? sslCertificate;
-
-  ServerTrustChallenge(
-      {required this.protectionSpace,
-      this.androidError,
-      this.iosError,
-      this.message,
-      this.sslCertificate})
-      : assert(protectionSpace != null);
-
-  Map<String, dynamic> toMap() {
-    return {
-      "protectionSpace": protectionSpace?.toMap(),
-      "androidError": androidError?.toValue(),
-      "iosError": iosError?.toValue(),
-      "message": message,
-      "sslCertificate": sslCertificate?.toMap()
-    };
   }
 
   Map<String, dynamic> toJson() {
@@ -1261,32 +1850,10 @@ class ClientCertResponse {
   }
 }
 
-///Class that represents the challenge of the [WebView.onReceivedClientCertRequest] event.
-///It provides all the information about the challenge.
-class ClientCertChallenge {
-  ///The protection space requiring authentication.
-  ProtectionSpace protectionSpace;
-
-  ClientCertChallenge({required this.protectionSpace});
-
-  Map<String, dynamic> toMap() {
-    return {"protectionSpace": protectionSpace.toMap()};
-  }
-
-  Map<String, dynamic> toJson() {
-    return this.toMap();
-  }
-
-  @override
-  String toString() {
-    return toMap().toString();
-  }
-}
-
 ///Class that represents a favicon of a website. It is used by [InAppWebViewController.getFavicons] method.
 class Favicon {
   ///The url of the favicon image.
-  String url;
+  Uri url;
 
   ///The relationship between the current web page and the favicon image.
   String? rel;
@@ -1300,7 +1867,12 @@ class Favicon {
   Favicon({required this.url, this.rel, this.width, this.height});
 
   Map<String, dynamic> toMap() {
-    return {"url": url, "rel": rel, "width": width, "height": height};
+    return {
+      "url": url.toString(),
+      "rel": rel,
+      "width": width,
+      "height": height
+    };
   }
 
   Map<String, dynamic> toJson() {
@@ -1313,7 +1885,7 @@ class Favicon {
   }
 }
 
-///Class that represents an Android-specific class used to override the way the cache is used.
+///An Android-specific class used to override the way the cache is used.
 class AndroidCacheMode {
   final int _value;
 
@@ -1329,8 +1901,8 @@ class AndroidCacheMode {
   static AndroidCacheMode? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidCacheMode.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidCacheMode.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1374,7 +1946,7 @@ class AndroidCacheMode {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an Android-specific class used to disable the action mode menu items.
+///An Android-specific class used to disable the action mode menu items.
 ///
 ///**NOTE**: available on Android 24+.
 class AndroidActionModeMenuItem {
@@ -1392,8 +1964,8 @@ class AndroidActionModeMenuItem {
   static AndroidActionModeMenuItem? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidActionModeMenuItem.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidActionModeMenuItem.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1438,7 +2010,7 @@ class AndroidActionModeMenuItem {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an Android-specific class used to indicate the force dark mode.
+///An Android-specific class used to indicate the force dark mode.
 ///
 ///**NOTE**: available on Android 29+.
 class AndroidForceDark {
@@ -1455,8 +2027,8 @@ class AndroidForceDark {
   static AndroidForceDark? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidForceDark.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidForceDark.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1495,7 +2067,7 @@ class AndroidForceDark {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an Android-specific class used to set the underlying layout algorithm.
+///An Android-specific class used to set the underlying layout algorithm.
 class AndroidLayoutAlgorithm {
   final String _value;
 
@@ -1510,8 +2082,8 @@ class AndroidLayoutAlgorithm {
   static AndroidLayoutAlgorithm? fromValue(String? value) {
     if (value != null) {
       try {
-        return AndroidLayoutAlgorithm.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidLayoutAlgorithm.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1544,7 +2116,7 @@ class AndroidLayoutAlgorithm {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an Android-specific class used to configure the WebView's behavior when a secure origin attempts to load a resource from an insecure origin.
+///An Android-specific class used to configure the WebView's behavior when a secure origin attempts to load a resource from an insecure origin.
 ///
 ///**NOTE**: available on Android 21+.
 class AndroidMixedContentMode {
@@ -1561,8 +2133,8 @@ class AndroidMixedContentMode {
   static AndroidMixedContentMode? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidMixedContentMode.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidMixedContentMode.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1609,7 +2181,7 @@ class AndroidMixedContentMode {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an iOS-specific class used to set the level of granularity with which the user can interactively select content in the web view.
+///An iOS-specific class used to set the level of granularity with which the user can interactively select content in the web view.
 class IOSWKSelectionGranularity {
   final int _value;
 
@@ -1623,8 +2195,8 @@ class IOSWKSelectionGranularity {
   static IOSWKSelectionGranularity? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSWKSelectionGranularity.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSWKSelectionGranularity.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1657,7 +2229,7 @@ class IOSWKSelectionGranularity {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an iOS-specific class used to specify a `dataDetectoryTypes` value that adds interactivity to web content that matches the value.
+///An iOS-specific class used to specify a `dataDetectoryTypes` value that adds interactivity to web content that matches the value.
 ///
 ///**NOTE**: available on iOS 10.0+.
 class IOSWKDataDetectorTypes {
@@ -1681,8 +2253,8 @@ class IOSWKDataDetectorTypes {
   static IOSWKDataDetectorTypes? fromValue(String? value) {
     if (value != null) {
       try {
-        return IOSWKDataDetectorTypes.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSWKDataDetectorTypes.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1751,8 +2323,8 @@ class IOSUIScrollViewDecelerationRate {
   static IOSUIScrollViewDecelerationRate? fromValue(String? value) {
     if (value != null) {
       try {
-        return IOSUIScrollViewDecelerationRate.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSUIScrollViewDecelerationRate.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1793,8 +2365,8 @@ class UserPreferredContentMode {
   static UserPreferredContentMode? fromValue(int? value) {
     if (value != null) {
       try {
-        return UserPreferredContentMode.values.firstWhere(
-                (element) => element.toValue() == value);
+        return UserPreferredContentMode.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1832,7 +2404,7 @@ class UserPreferredContentMode {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an iOS-specific class used to specify the modal presentation style when presenting a view controller.
+///An iOS-specific class used to specify the modal presentation style when presenting a view controller.
 class IOSUIModalPresentationStyle {
   final int _value;
 
@@ -1854,8 +2426,8 @@ class IOSUIModalPresentationStyle {
   static IOSUIModalPresentationStyle? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSUIModalPresentationStyle.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSUIModalPresentationStyle.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1932,7 +2504,7 @@ class IOSUIModalPresentationStyle {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an iOS-specific class used to specify the transition style when presenting a view controller.
+///An iOS-specific class used to specify the transition style when presenting a view controller.
 class IOSUIModalTransitionStyle {
   final int _value;
 
@@ -1948,8 +2520,8 @@ class IOSUIModalTransitionStyle {
   static IOSUIModalTransitionStyle? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSUIModalTransitionStyle.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSUIModalTransitionStyle.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -1998,7 +2570,7 @@ class IOSUIModalTransitionStyle {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an iOS-specific class used to set the custom style for the dismiss button.
+///An iOS-specific class used to set the custom style for the dismiss button.
 ///
 ///**NOTE**: available on iOS 11.0+.
 class IOSSafariDismissButtonStyle {
@@ -2015,8 +2587,8 @@ class IOSSafariDismissButtonStyle {
   static IOSSafariDismissButtonStyle? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSSafariDismissButtonStyle.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSSafariDismissButtonStyle.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -2052,174 +2624,6 @@ class IOSSafariDismissButtonStyle {
 
   @override
   int get hashCode => _value.hashCode;
-}
-
-///Class that represents the options that can be used for a [WebView].
-class InAppWebViewGroupOptions {
-  ///Cross-platform options.
-  InAppWebViewOptions? crossPlatform;
-
-  ///Android-specific options.
-  AndroidInAppWebViewOptions? android;
-
-  ///iOS-specific options.
-  IOSInAppWebViewOptions? ios;
-
-  InAppWebViewGroupOptions({this.crossPlatform, this.android, this.ios}) {
-    this.crossPlatform = this.crossPlatform ?? InAppWebViewOptions();
-    this.android = this.android ?? AndroidInAppWebViewOptions();
-    this.ios = this.ios ?? IOSInAppWebViewOptions();
-  }
-
-  Map<String, dynamic> toMap() {
-    Map<String, dynamic> options = {};
-    options.addAll(this.crossPlatform?.toMap() ?? {});
-    if (defaultTargetPlatform == TargetPlatform.android)
-      options.addAll(this.android?.toMap() ?? {});
-    else if (defaultTargetPlatform == TargetPlatform.iOS) options.addAll(this.ios?.toMap() ?? {});
-
-    return options;
-  }
-
-  static InAppWebViewGroupOptions fromMap(Map<String, dynamic> options) {
-    InAppWebViewGroupOptions inAppWebViewGroupOptions =
-        InAppWebViewGroupOptions();
-
-    inAppWebViewGroupOptions.crossPlatform =
-        InAppWebViewOptions.fromMap(options);
-    if (defaultTargetPlatform == TargetPlatform.android)
-      inAppWebViewGroupOptions.android =
-          AndroidInAppWebViewOptions.fromMap(options);
-    else if (defaultTargetPlatform == TargetPlatform.iOS)
-      inAppWebViewGroupOptions.ios = IOSInAppWebViewOptions.fromMap(options);
-
-    return inAppWebViewGroupOptions;
-  }
-
-  Map<String, dynamic> toJson() {
-    return this.toMap();
-  }
-
-  @override
-  String toString() {
-    return toMap().toString();
-  }
-
-  InAppWebViewGroupOptions copy() {
-    return InAppWebViewGroupOptions.fromMap(this.toMap());
-  }
-}
-
-///Class that represents the options that can be used for an [InAppBrowser] WebView.
-class InAppBrowserClassOptions {
-  ///Cross-platform options.
-  InAppBrowserOptions? crossPlatform;
-
-  ///Android-specific options.
-  AndroidInAppBrowserOptions? android;
-
-  ///iOS-specific options.
-  IOSInAppBrowserOptions? ios;
-
-  ///WebView options.
-  InAppWebViewGroupOptions? inAppWebViewGroupOptions;
-
-  InAppBrowserClassOptions(
-      {this.crossPlatform,
-      this.android,
-      this.ios,
-      this.inAppWebViewGroupOptions}) {
-    this.crossPlatform = this.crossPlatform ?? InAppBrowserOptions();
-    this.android = this.android ?? AndroidInAppBrowserOptions();
-    this.ios = this.ios ?? IOSInAppBrowserOptions();
-    this.inAppWebViewGroupOptions =
-        this.inAppWebViewGroupOptions ?? InAppWebViewGroupOptions();
-  }
-
-  Map<String, dynamic> toMap() {
-    Map<String, dynamic> options = {};
-
-    options.addAll(this.crossPlatform?.toMap() ?? {});
-    options.addAll(this.inAppWebViewGroupOptions?.crossPlatform?.toMap() ?? {});
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      options.addAll(this.android?.toMap() ?? {});
-      options.addAll(this.inAppWebViewGroupOptions?.android?.toMap() ?? {});
-    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
-      options.addAll(this.ios?.toMap() ?? {});
-      options.addAll(this.inAppWebViewGroupOptions?.ios?.toMap() ?? {});
-    }
-
-    return options;
-  }
-
-  Map<String, dynamic> toJson() {
-    return this.toMap();
-  }
-
-  @override
-  String toString() {
-    return toMap().toString();
-  }
-
-  static InAppBrowserClassOptions fromMap(Map<String, dynamic> options) {
-    InAppBrowserClassOptions inAppBrowserClassOptions =
-        InAppBrowserClassOptions();
-
-    inAppBrowserClassOptions.crossPlatform =
-        InAppBrowserOptions.fromMap(options);
-    inAppBrowserClassOptions.inAppWebViewGroupOptions =
-        InAppWebViewGroupOptions();
-    inAppBrowserClassOptions.inAppWebViewGroupOptions!.crossPlatform =
-        InAppWebViewOptions.fromMap(options);
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      inAppBrowserClassOptions.android =
-          AndroidInAppBrowserOptions.fromMap(options);
-      inAppBrowserClassOptions.inAppWebViewGroupOptions!.android =
-          AndroidInAppWebViewOptions.fromMap(options);
-    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
-      inAppBrowserClassOptions.ios = IOSInAppBrowserOptions.fromMap(options);
-      inAppBrowserClassOptions.inAppWebViewGroupOptions!.ios =
-          IOSInAppWebViewOptions.fromMap(options);
-    }
-
-    return inAppBrowserClassOptions;
-  }
-
-  InAppBrowserClassOptions copy() {
-    return InAppBrowserClassOptions.fromMap(this.toMap());
-  }
-}
-
-///Class that represents the options that can be used for an [ChromeSafariBrowser] window.
-class ChromeSafariBrowserClassOptions {
-  ///Android-specific options.
-  AndroidChromeCustomTabsOptions? android;
-
-  ///iOS-specific options.
-  IOSSafariOptions? ios;
-
-  ChromeSafariBrowserClassOptions({this.android, this.ios}) {
-    this.android = this.android ?? AndroidChromeCustomTabsOptions();
-    this.ios = this.ios ?? IOSSafariOptions();
-  }
-
-  Map<String, dynamic> toMap() {
-    Map<String, dynamic> options = {};
-    if (defaultTargetPlatform == TargetPlatform.android)
-      options.addAll(this.android?.toMap() ?? {});
-    else if (defaultTargetPlatform == TargetPlatform.iOS) options.addAll(this.ios?.toMap() ?? {});
-
-    return options;
-  }
-
-  Map<String, dynamic> toJson() {
-    return this.toMap();
-  }
-
-  @override
-  String toString() {
-    return toMap().toString();
-  }
 }
 
 ///Class used by [AjaxRequest] class.
@@ -2276,8 +2680,8 @@ class AjaxRequestEventType {
   static AjaxRequestEventType? fromValue(String? value) {
     if (value != null) {
       try {
-        return AjaxRequestEventType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AjaxRequestEventType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -2336,6 +2740,36 @@ class AjaxRequestEvent {
   int? total;
 
   AjaxRequestEvent({this.type, this.lengthComputable, this.loaded, this.total});
+
+  static AjaxRequestEvent? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    return AjaxRequestEvent(
+        type: AjaxRequestEventType.fromValue(map["type"]),
+        lengthComputable: map["lengthComputable"],
+        loaded: map["loaded"],
+        total: map["total"]);
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      "type": type?.toValue(),
+      "lengthComputable": lengthComputable,
+      "loaded": loaded,
+      "total": total,
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
 }
 
 ///Class used by [AjaxRequest] class. It represents the state of an [AjaxRequest].
@@ -2355,8 +2789,8 @@ class AjaxRequestReadyState {
   static AjaxRequestReadyState? fromValue(int? value) {
     if (value != null) {
       try {
-        return AjaxRequestReadyState.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AjaxRequestReadyState.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -2406,13 +2840,21 @@ class AjaxRequestReadyState {
 
 ///Class that represents the HTTP headers of an [AjaxRequest].
 class AjaxRequestHeaders {
-  Map<dynamic, dynamic> _headers;
+  Map<String, dynamic> _headers;
   Map<String, dynamic> _newHeaders = {};
 
   AjaxRequestHeaders(this._headers);
 
+  static AjaxRequestHeaders? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    return AjaxRequestHeaders(map);
+  }
+
   ///Gets the HTTP headers of the [AjaxRequest].
-  Map<dynamic, dynamic> getHeaders() {
+  Map<String, dynamic> getHeaders() {
     return this._headers;
   }
 
@@ -2427,18 +2869,27 @@ class AjaxRequestHeaders {
   Map<String, dynamic> toMap() {
     return _newHeaders;
   }
+
+  Map<String, dynamic> toJson() {
+    return toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
 }
 
 ///Class that represents a JavaScript [XMLHttpRequest](https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequest) object.
 class AjaxRequest {
   ///Data passed as a parameter to the `XMLHttpRequest.send()` method.
-  dynamic data;
+  dynamic? data;
 
   ///The HTTP request method of the `XMLHttpRequest` request.
   String? method;
 
   ///The URL of the `XMLHttpRequest` request.
-  String? url;
+  Uri? url;
 
   ///An optional Boolean parameter, defaulting to true, indicating whether or not the request is performed asynchronously.
   bool? isAsync;
@@ -2467,7 +2918,7 @@ class AjaxRequest {
   ///The serialized URL of the response or the empty string if the URL is null.
   ///If the URL is returned, any URL fragment present in the URL will be stripped away.
   ///The value of responseURL will be the final URL obtained after any redirects.
-  String? responseURL;
+  Uri? responseURL;
 
   ///It is an enumerated string value specifying the type of data contained in the response.
   ///It also lets the author change the [response type](https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequest/responseType).
@@ -2490,7 +2941,7 @@ class AjaxRequest {
   String? statusText;
 
   ///All the response headers or returns null if no response has been received. If a network error happened, an empty string is returned.
-  Map<dynamic, dynamic>? responseHeaders;
+  Map<String, dynamic>? responseHeaders;
 
   ///Event type of the `XMLHttpRequest` request.
   AjaxRequestEvent? event;
@@ -2519,11 +2970,39 @@ class AjaxRequest {
       this.event,
       this.action = AjaxRequestAction.PROCEED});
 
+  static AjaxRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    return AjaxRequest(
+        data: map["data"],
+        method: map["method"],
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        isAsync: map["isAsync"],
+        user: map["user"],
+        password: map["password"],
+        withCredentials: map["withCredentials"],
+        headers:
+            AjaxRequestHeaders.fromMap(map["headers"]?.cast<String, dynamic>()),
+        readyState: AjaxRequestReadyState.fromValue(map["readyState"]),
+        status: map["status"],
+        responseURL:
+            map["responseURL"] != null ? Uri.parse(map["responseURL"]) : null,
+        responseType: map["responseType"],
+        response: map["response"],
+        responseText: map["responseText"],
+        responseXML: map["responseXML"],
+        statusText: map["statusText"],
+        responseHeaders: map["responseHeaders"]?.cast<String, dynamic>(),
+        event: AjaxRequestEvent.fromMap(map["event"]?.cast<String, dynamic>()));
+  }
+
   Map<String, dynamic> toMap() {
     return {
       "data": data,
       "method": method,
-      "url": url,
+      "url": url?.toString(),
       "isAsync": isAsync,
       "user": user,
       "password": password,
@@ -2531,7 +3010,7 @@ class AjaxRequest {
       "headers": headers?.toMap(),
       "readyState": readyState?.toValue(),
       "status": status,
-      "responseURL": responseURL,
+      "responseURL": responseURL?.toString(),
       "responseType": responseType,
       "response": response,
       "responseText": responseText,
@@ -2583,6 +3062,13 @@ class FetchRequestCredential {
     return {"type": type};
   }
 
+  static FetchRequestCredential? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return FetchRequestCredential(type: map["type"]);
+  }
+
   Map<String, dynamic> toJson() {
     return this.toMap();
   }
@@ -2605,6 +3091,15 @@ class FetchRequestCredentialDefault extends FetchRequestCredential {
       "type": type,
       "value": value,
     };
+  }
+
+  static FetchRequestCredentialDefault? fromMap(
+      Map<String, dynamic>? credentialsMap) {
+    if (credentialsMap == null) {
+      return null;
+    }
+    return FetchRequestCredentialDefault(
+        type: credentialsMap["type"], value: credentialsMap["value"]);
   }
 
   Map<String, dynamic> toJson() {
@@ -2632,11 +3127,27 @@ class FetchRequestFederatedCredential extends FetchRequestCredential {
   String? provider;
 
   ///URL pointing to an image for an icon. This image is intended for display in a credential chooser. The URL must be accessible without authentication.
-  String? iconURL;
+  Uri? iconURL;
 
   FetchRequestFederatedCredential(
       {type, this.id, this.name, this.protocol, this.provider, this.iconURL})
       : super(type: type);
+
+  static FetchRequestFederatedCredential? fromMap(
+      Map<String, dynamic>? credentialsMap) {
+    if (credentialsMap == null) {
+      return null;
+    }
+    return FetchRequestFederatedCredential(
+        type: credentialsMap["type"],
+        id: credentialsMap["id"],
+        name: credentialsMap["name"],
+        protocol: credentialsMap["protocol"],
+        provider: credentialsMap["provider"],
+        iconURL: credentialsMap["iconURL"] != null
+            ? Uri.parse(credentialsMap["iconURL"])
+            : null);
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -2645,7 +3156,7 @@ class FetchRequestFederatedCredential extends FetchRequestCredential {
       "name": name,
       "protocol": protocol,
       "provider": provider,
-      "iconURL": iconURL
+      "iconURL": iconURL?.toString()
     };
   }
 
@@ -2671,11 +3182,26 @@ class FetchRequestPasswordCredential extends FetchRequestCredential {
   String? password;
 
   ///URL pointing to an image for an icon. This image is intended for display in a credential chooser. The URL must be accessible without authentication.
-  String? iconURL;
+  Uri? iconURL;
 
   FetchRequestPasswordCredential(
       {type, this.id, this.name, this.password, this.iconURL})
       : super(type: type);
+
+  static FetchRequestPasswordCredential? fromMap(
+      Map<String, dynamic>? credentialsMap) {
+    if (credentialsMap == null) {
+      return null;
+    }
+    return FetchRequestPasswordCredential(
+        type: credentialsMap["type"],
+        id: credentialsMap["id"],
+        name: credentialsMap["name"],
+        password: credentialsMap["password"],
+        iconURL: credentialsMap["iconURL"] != null
+            ? Uri.parse(credentialsMap["iconURL"])
+            : null);
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -2683,7 +3209,7 @@ class FetchRequestPasswordCredential extends FetchRequestCredential {
       "id": id,
       "name": name,
       "password": password,
-      "iconURL": iconURL
+      "iconURL": iconURL?.toString()
     };
   }
 
@@ -2700,7 +3226,7 @@ class FetchRequestPasswordCredential extends FetchRequestCredential {
 ///Class that represents a HTTP request created with JavaScript using the [Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch).
 class FetchRequest {
   ///The URL of the request.
-  String? url;
+  Uri? url;
 
   ///The HTTP request method used of the request.
   String? method;
@@ -2709,7 +3235,7 @@ class FetchRequest {
   Map<String, dynamic>? headers;
 
   ///Body of the request.
-  Uint8List? body;
+  dynamic? body;
 
   ///The mode used by the request.
   String? mode;
@@ -2727,7 +3253,7 @@ class FetchRequest {
   String? referrer;
 
   ///The value of the referer HTTP header.
-  String? referrerPolicy;
+  ReferrerPolicy? referrerPolicy;
 
   ///Contains the subresource integrity value of the request.
   String? integrity;
@@ -2753,9 +3279,42 @@ class FetchRequest {
       this.keepalive,
       this.action = FetchRequestAction.PROCEED});
 
+  static FetchRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    Map<String, dynamic>? credentialMap =
+        map["credentials"]?.cast<String, dynamic>();
+    FetchRequestCredential? credentials;
+    if (credentialMap != null) {
+      if (credentialMap["type"] == "default") {
+        credentials = FetchRequestCredentialDefault.fromMap(credentialMap);
+      } else if (credentialMap["type"] == "federated") {
+        credentials = FetchRequestFederatedCredential.fromMap(credentialMap);
+      } else if (credentialMap["type"] == "password") {
+        credentials = FetchRequestPasswordCredential.fromMap(credentialMap);
+      }
+    }
+
+    return FetchRequest(
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        method: map["method"],
+        headers: map["headers"]?.cast<String, dynamic>(),
+        body: map["body"],
+        mode: map["mode"],
+        credentials: credentials,
+        cache: map["cache"],
+        redirect: map["redirect"],
+        referrer: map["referrer"],
+        referrerPolicy: ReferrerPolicy.fromValue(map["referrerPolicy"]),
+        integrity: map["integrity"],
+        keepalive: map["keepalive"]);
+  }
+
   Map<String, dynamic> toMap() {
     return {
-      "url": url,
+      "url": url?.toString(),
       "method": method,
       "headers": headers,
       "body": body,
@@ -2764,7 +3323,7 @@ class FetchRequest {
       "cache": cache,
       "redirect": redirect,
       "referrer": referrer,
-      "referrerPolicy": referrerPolicy,
+      "referrerPolicy": referrerPolicy?.toValue(),
       "integrity": integrity,
       "keepalive": keepalive,
       "action": action?.toValue()
@@ -2778,31 +3337,6 @@ class FetchRequest {
   @override
   String toString() {
     return toMap().toString();
-  }
-
-  static FetchRequestCredential? fromMap(credentialsMap) {
-    if (credentialsMap != null) {
-      if (credentialsMap["type"] == "default") {
-        return FetchRequestCredentialDefault(
-            type: credentialsMap["type"], value: credentialsMap["value"]);
-      } else if (credentialsMap["type"] == "federated") {
-        return FetchRequestFederatedCredential(
-            type: credentialsMap["type"],
-            id: credentialsMap["id"],
-            name: credentialsMap["name"],
-            protocol: credentialsMap["protocol"],
-            provider: credentialsMap["provider"],
-            iconURL: credentialsMap["iconURL"]);
-      } else if (credentialsMap["type"] == "password") {
-        return FetchRequestPasswordCredential(
-            type: credentialsMap["type"],
-            id: credentialsMap["id"],
-            name: credentialsMap["name"],
-            password: credentialsMap["password"],
-            iconURL: credentialsMap["iconURL"]);
-      }
-    }
-    return null;
   }
 }
 
@@ -2826,8 +3360,8 @@ class ContentBlockerTriggerResourceType {
   static ContentBlockerTriggerResourceType? fromValue(String? value) {
     if (value != null) {
       try {
-        return ContentBlockerTriggerResourceType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return ContentBlockerTriggerResourceType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -2877,8 +3411,8 @@ class ContentBlockerTriggerLoadType {
   static ContentBlockerTriggerLoadType? fromValue(String? value) {
     if (value != null) {
       try {
-        return ContentBlockerTriggerLoadType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return ContentBlockerTriggerLoadType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -2920,8 +3454,8 @@ class ContentBlockerActionType {
   static ContentBlockerActionType? fromValue(String? value) {
     if (value != null) {
       try {
-        return ContentBlockerActionType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return ContentBlockerActionType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -3079,18 +3613,18 @@ class PermissionRequestResponse {
 
 ///Class that is used by [WebView.shouldOverrideUrlLoading] event.
 ///It represents the policy to pass back to the decision handler.
-class ShouldOverrideUrlLoadingAction {
+class NavigationActionPolicy {
   final int _value;
 
-  const ShouldOverrideUrlLoadingAction._internal(this._value);
+  const NavigationActionPolicy._internal(this._value);
 
   int toValue() => _value;
 
   ///Cancel the navigation.
-  static const CANCEL = const ShouldOverrideUrlLoadingAction._internal(0);
+  static const CANCEL = const NavigationActionPolicy._internal(0);
 
   ///Allow the navigation to continue.
-  static const ALLOW = const ShouldOverrideUrlLoadingAction._internal(1);
+  static const ALLOW = const NavigationActionPolicy._internal(1);
 
   bool operator ==(value) => value == _value;
 
@@ -3122,8 +3656,8 @@ class IOSWKNavigationType {
   static IOSWKNavigationType? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSWKNavigationType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSWKNavigationType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -3155,6 +3689,25 @@ class IOSWKNavigationType {
 
   @override
   int get hashCode => _value.hashCode;
+
+  @override
+  String toString() {
+    switch (_value) {
+      case 0:
+        return "LINK_ACTIVATED";
+      case 1:
+        return "FORM_SUBMITTED";
+      case 2:
+        return "BACK_FORWARD";
+      case 3:
+        return "RELOAD";
+      case 4:
+        return "FORM_RESUBMITTED";
+      case -1:
+      default:
+        return "OTHER";
+    }
+  }
 }
 
 ///An iOS-specific Class that represents the constants used to specify interaction with the cached responses.
@@ -3175,8 +3728,8 @@ class IOSURLRequestCachePolicy {
   static IOSURLRequestCachePolicy? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSURLRequestCachePolicy.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSURLRequestCachePolicy.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -3207,33 +3760,39 @@ class IOSURLRequestCachePolicy {
 
   ///Use the caching logic defined in the protocol implementation, if any, for a particular URL load request.
   ///This is the default policy for URL load requests.
-  static const USE_PROTOCOL_CACHE_POLICY = const IOSURLRequestCachePolicy._internal(0);
+  static const USE_PROTOCOL_CACHE_POLICY =
+      const IOSURLRequestCachePolicy._internal(0);
 
   ///The URL load should be loaded only from the originating source.
   ///This policy specifies that no existing cache data should be used to satisfy a URL load request.
   ///
   ///**NOTE**: Always use this policy if you are making HTTP or HTTPS byte-range requests.
-  static const RELOAD_IGNORING_LOCAL_CACHE_DATA = const IOSURLRequestCachePolicy._internal(1);
+  static const RELOAD_IGNORING_LOCAL_CACHE_DATA =
+      const IOSURLRequestCachePolicy._internal(1);
 
   ///Use existing cache data, regardless or age or expiration date, loading from originating source only if there is no cached data.
-  static const RETURN_CACHE_DATA_ELSE_LOAD = const IOSURLRequestCachePolicy._internal(2);
+  static const RETURN_CACHE_DATA_ELSE_LOAD =
+      const IOSURLRequestCachePolicy._internal(2);
 
   ///Use existing cache data, regardless or age or expiration date, and fail if no cached data is available.
   ///
   ///If there is no existing data in the cache corresponding to a URL load request,
   ///no attempt is made to load the data from the originating source, and the load is considered to have failed.
   ///This constant specifies a behavior that is similar to an “offline” mode.
-  static const RETURN_CACHE_DATA_DONT_LOAD = const IOSURLRequestCachePolicy._internal(3);
+  static const RETURN_CACHE_DATA_DONT_LOAD =
+      const IOSURLRequestCachePolicy._internal(3);
 
   ///Ignore local cache data, and instruct proxies and other intermediates to disregard their caches so far as the protocol allows.
   ///
   ///**NOTE**: Versions earlier than macOS 15, iOS 13, watchOS 6, and tvOS 13 don’t implement this constant.
-  static const RELOAD_IGNORING_LOCAL_AND_REMOTE_CACHE_DATA = const IOSURLRequestCachePolicy._internal(4);
+  static const RELOAD_IGNORING_LOCAL_AND_REMOTE_CACHE_DATA =
+      const IOSURLRequestCachePolicy._internal(4);
 
   ///Use cache data if the origin source can validate it; otherwise, load from the origin.
   ///
   ///**NOTE**: Versions earlier than macOS 15, iOS 13, watchOS 6, and tvOS 13 don’t implement this constant.
-  static const RELOAD_REVALIDATING_CACHE_DATA = const IOSURLRequestCachePolicy._internal(5);
+  static const RELOAD_REVALIDATING_CACHE_DATA =
+      const IOSURLRequestCachePolicy._internal(5);
 
   bool operator ==(value) => value == _value;
 
@@ -3261,8 +3820,8 @@ class IOSURLRequestNetworkServiceType {
   static IOSURLRequestNetworkServiceType? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSURLRequestNetworkServiceType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSURLRequestNetworkServiceType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -3313,18 +3872,22 @@ class IOSURLRequestNetworkServiceType {
   ///A service type for data that the user is actively waiting for.
   ///
   ///Use this service type for interactive situations where the user is anticipating a quick response, like instant messaging or completing a purchase.
-  static const RESPONSIVE_DATA = const IOSURLRequestNetworkServiceType._internal(6);
+  static const RESPONSIVE_DATA =
+      const IOSURLRequestNetworkServiceType._internal(6);
 
   ///A service type for streaming audio/video data.
-  static const AV_STREAMING = const IOSURLRequestNetworkServiceType._internal(8);
+  static const AV_STREAMING =
+      const IOSURLRequestNetworkServiceType._internal(8);
 
   ///A service type for responsive (time-sensitive) audio/video data.
-  static const RESPONSIVE_AV = const IOSURLRequestNetworkServiceType._internal(9);
+  static const RESPONSIVE_AV =
+      const IOSURLRequestNetworkServiceType._internal(9);
 
   ///A service type for call signaling.
   ///
   ///Use this service type with network traffic that establishes, maintains, or tears down a VoIP call.
-  static const CALL_SIGNALING = const IOSURLRequestNetworkServiceType._internal(11);
+  static const CALL_SIGNALING =
+      const IOSURLRequestNetworkServiceType._internal(11);
 
   bool operator ==(value) => value == _value;
 
@@ -3332,18 +3895,103 @@ class IOSURLRequestNetworkServiceType {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents the navigation request used by the [WebView.shouldOverrideUrlLoading] event.
-class ShouldOverrideUrlLoadingRequest {
-  ///Represents the url of the navigation request.
-  String url;
+///An object that identifies the origin of a particular resource.
+///
+///**NOTE**: available only on iOS 9.0+.
+class IOSWKSecurityOrigin {
+  ///The security origin’s host.
+  String host;
 
-  ///Represents the method of the navigation request. On Android < 21, this value is always `GET`.
-  String? method;
+  ///The security origin's port.
+  int port;
 
-  ///Represents the headers of the navigation request. On Android < 21, this is always `null`.
-  Map<String, String>? headers;
+  ///The security origin's protocol.
+  String protocol;
 
-  ///Indicates whether the request was made for the main frame. On Android < 21, this is always `true`.
+  IOSWKSecurityOrigin(
+      {required this.host, required this.port, required this.protocol});
+
+  static IOSWKSecurityOrigin? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return IOSWKSecurityOrigin(
+        host: map["host"], port: map["port"], protocol: map["protocol"]);
+  }
+
+  Map<String, dynamic> toMap() {
+    return {"host": host, "port": port, "protocol": protocol};
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///An object that contains information about a frame on a webpage.
+///
+///**NOTE**: available only on iOS.
+class IOSWKFrameInfo {
+  ///A Boolean value indicating whether the frame is the web site's main frame or a subframe.
+  bool isMainFrame;
+
+  ///The frame’s current request.
+  URLRequest? request;
+
+  ///The frame’s security origin.
+  IOSWKSecurityOrigin? securityOrigin;
+
+  IOSWKFrameInfo(
+      {required this.isMainFrame, required this.request, this.securityOrigin});
+
+  static IOSWKFrameInfo? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return IOSWKFrameInfo(
+        isMainFrame: map["isMainFrame"],
+        request: URLRequest.fromMap(map["request"]?.cast<String, dynamic>()),
+        securityOrigin: IOSWKSecurityOrigin.fromMap(
+            map["securityOrigin"]?.cast<String, dynamic>()));
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      "isMainFrame": isMainFrame,
+      "request": request?.toMap(),
+      "securityOrigin": securityOrigin?.toMap()
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///An object that contains information about an action that causes navigation to occur.
+class NavigationAction {
+  ///The URL request object associated with the navigation action.
+  ///
+  ///**NOTE for Android**: If the request is associated to the [WebView.onCreateWindow] event
+  ///and the window has been created using JavaScript, [request.url] will be `null`,
+  ///the [request.method] is always `GET`, and [request.headers] value is always `null`.
+  ///Also, on Android < 21, the [request.method]  is always `GET` and [request.headers] value is always `null`.
+  URLRequest request;
+
+  ///Indicates whether the request was made for the main frame.
+  ///
+  ///**NOTE for Android**: If the request is associated to the [WebView.onCreateWindow] event, this is always `true`.
+  ///Also, on Android < 21, this is always `true`.
   bool isForMainFrame;
 
   ///Gets whether a gesture (such as a click) was associated with the request.
@@ -3356,7 +4004,9 @@ class ShouldOverrideUrlLoadingRequest {
 
   ///Gets whether the request was a result of a server-side redirect.
   ///
-  ///**NOTE**: available only on Android. On Android < 21, this is always `false`.
+  ///**NOTE**: available only on Android.
+  ///If the request is associated to the [WebView.onCreateWindow] event, this is always `false`.
+  ///Also, on Android < 21, this is always `false`.
   bool? androidIsRedirect;
 
   ///The type of action triggering the navigation.
@@ -3364,80 +4014,51 @@ class ShouldOverrideUrlLoadingRequest {
   ///**NOTE**: available only on iOS.
   IOSWKNavigationType? iosWKNavigationType;
 
-  ///A Boolean value indicating whether the request is allowed to use the built-in cellular radios to satisfy the request.
+  ///The frame that requested the navigation.
   ///
   ///**NOTE**: available only on iOS.
-  bool? iosAllowsCellularAccess;
+  IOSWKFrameInfo? iosSourceFrame;
 
-  ///A Boolean value that indicates whether the request may use the network when the user has specified Low Data Mode.
-  ///
-  ///**NOTE**: available only on iOS 13.0+.
-  bool? iosAllowsConstrainedNetworkAccess;
-
-  ///A Boolean value that indicates whether connections may use a network interface that the system considers expensive.
-  ///
-  ///**NOTE**: available only on iOS 13.0+.
-  bool? iosAllowsExpensiveNetworkAccess;
-
-  ///The request’s cache policy.
+  ///The frame in which to display the new content.
   ///
   ///**NOTE**: available only on iOS.
-  IOSURLRequestCachePolicy? iosCachePolicy;
+  IOSWKFrameInfo? iosTargetFrame;
 
-  ///A Boolean value indicating whether cookies will be sent with and set for this request.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosHttpShouldHandleCookies;
-
-  ///A Boolean value indicating whether the request should transmit before the previous response is received.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosHttpShouldUsePipelining;
-
-  ///The service type associated with this request.
-  ///
-  ///**NOTE**: available only on iOS.
-  IOSURLRequestNetworkServiceType? iosNetworkServiceType;
-
-  ///The timeout interval of the request.
-  ///
-  ///**NOTE**: available only on iOS.
-  double? iosTimeoutInterval;
-
-  ShouldOverrideUrlLoadingRequest(
-      {required this.url,
-      this.method,
-      this.headers,
+  NavigationAction(
+      {required this.request,
       required this.isForMainFrame,
       this.androidHasGesture,
       this.androidIsRedirect,
       this.iosWKNavigationType,
-      this.iosAllowsCellularAccess,
-      this.iosAllowsConstrainedNetworkAccess,
-      this.iosAllowsExpensiveNetworkAccess,
-      this.iosCachePolicy,
-      this.iosHttpShouldHandleCookies,
-      this.iosHttpShouldUsePipelining,
-      this.iosNetworkServiceType,
-      this.iosTimeoutInterval});
+      this.iosSourceFrame,
+      this.iosTargetFrame});
+
+  static NavigationAction? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return NavigationAction(
+        request: URLRequest.fromMap(map["request"].cast<String, dynamic>())!,
+        isForMainFrame: map["isForMainFrame"],
+        androidHasGesture: map["androidHasGesture"],
+        androidIsRedirect: map["androidIsRedirect"],
+        iosWKNavigationType:
+            IOSWKNavigationType.fromValue(map["iosWKNavigationType"]),
+        iosSourceFrame: IOSWKFrameInfo.fromMap(
+            map["iosSourceFrame"]?.cast<String, dynamic>()),
+        iosTargetFrame: IOSWKFrameInfo.fromMap(
+            map["iosTargetFrame"]?.cast<String, dynamic>()));
+  }
 
   Map<String, dynamic> toMap() {
     return {
-      "url": url,
-      "headers": headers,
-      "method": method,
+      "request": request.toString(),
       "isForMainFrame": isForMainFrame,
       "androidHasGesture": androidHasGesture,
       "androidIsRedirect": androidIsRedirect,
       "iosWKNavigationType": iosWKNavigationType?.toValue(),
-      "iosAllowsCellularAccess": iosAllowsCellularAccess,
-      "iosAllowsConstrainedNetworkAccess": iosAllowsConstrainedNetworkAccess,
-      "iosAllowsExpensiveNetworkAccess": iosAllowsExpensiveNetworkAccess,
-      "iosCachePolicy": iosCachePolicy?.toValue(),
-      "iosHttpShouldHandleCookies": iosHttpShouldHandleCookies,
-      "iosHttpShouldUsePipelining": iosHttpShouldUsePipelining,
-      "iosNetworkServiceType": iosNetworkServiceType?.toValue(),
-      "iosTimeoutInterval": iosTimeoutInterval,
+      "iosSourceFrame": iosSourceFrame?.toMap(),
+      "iosTargetFrame": iosTargetFrame?.toMap(),
     };
   }
 
@@ -3452,12 +4073,7 @@ class ShouldOverrideUrlLoadingRequest {
 }
 
 ///Class that represents the navigation request used by the [WebView.onCreateWindow] event.
-class CreateWindowRequest {
-  ///The URL of the request.
-  ///
-  ///**NOTE**: On Android, if the window has been created using JavaScript, this will be `null`.
-  String? url;
-
+class CreateWindowAction extends NavigationAction {
   ///The window id. Used by [WebView] to create a new WebView.
   int windowId;
 
@@ -3466,98 +4082,61 @@ class CreateWindowRequest {
   ///**NOTE**: available only on Android.
   bool? androidIsDialog;
 
-  ///Indicates if the request was initiated by a user gesture, such as the user clicking a link.
-  ///
-  ///**NOTE**: available only on Android.
-  bool? androidIsUserGesture;
-
-  ///The type of action triggering the navigation.
+  ///Window features requested by the webpage.
   ///
   ///**NOTE**: available only on iOS.
-  IOSWKNavigationType? iosWKNavigationType;
+  IOSWKWindowFeatures? iosWindowFeatures;
 
-  ///Whether the request was made in order to fetch the main frame's document.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosIsForMainFrame;
-
-  ///A Boolean value indicating whether the request is allowed to use the built-in cellular radios to satisfy the request.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosAllowsCellularAccess;
-
-  ///A Boolean value that indicates whether the request may use the network when the user has specified Low Data Mode.
-  ///
-  ///**NOTE**: available only on iOS 13.0+.
-  bool? iosAllowsConstrainedNetworkAccess;
-
-  ///A Boolean value that indicates whether connections may use a network interface that the system considers expensive.
-  ///
-  ///**NOTE**: available only on iOS 13.0+.
-  bool? iosAllowsExpensiveNetworkAccess;
-
-  ///The request’s cache policy.
-  ///
-  ///**NOTE**: available only on iOS.
-  IOSURLRequestCachePolicy? iosCachePolicy;
-
-  ///A Boolean value indicating whether cookies will be sent with and set for this request.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosHttpShouldHandleCookies;
-
-  ///A Boolean value indicating whether the request should transmit before the previous response is received.
-  ///
-  ///**NOTE**: available only on iOS.
-  bool? iosHttpShouldUsePipelining;
-
-  ///The service type associated with this request.
-  ///
-  ///**NOTE**: available only on iOS.
-  IOSURLRequestNetworkServiceType? iosNetworkServiceType;
-
-  ///The timeout interval of the request.
-  ///
-  ///**NOTE**: available only on iOS.
-  double? iosTimeoutInterval;
-
-  CreateWindowRequest(
-      {this.url,
-      required this.windowId,
+  CreateWindowAction(
+      {required this.windowId,
       this.androidIsDialog,
-      this.androidIsUserGesture,
-      this.iosWKNavigationType,
-      this.iosIsForMainFrame,
-      this.iosAllowsCellularAccess,
-      this.iosAllowsConstrainedNetworkAccess,
-      this.iosAllowsExpensiveNetworkAccess,
-      this.iosCachePolicy,
-      this.iosHttpShouldHandleCookies,
-      this.iosHttpShouldUsePipelining,
-      this.iosNetworkServiceType,
-      this.iosTimeoutInterval});
+      this.iosWindowFeatures,
+      required URLRequest request,
+      required bool isForMainFrame,
+      bool? androidHasGesture,
+      bool? androidIsRedirect,
+      IOSWKNavigationType? iosWKNavigationType,
+      IOSWKFrameInfo? iosSourceFrame,
+      IOSWKFrameInfo? iosTargetFrame})
+      : super(
+            request: request,
+            isForMainFrame: isForMainFrame,
+            androidHasGesture: androidHasGesture,
+            androidIsRedirect: androidIsRedirect,
+            iosWKNavigationType: iosWKNavigationType,
+            iosSourceFrame: iosSourceFrame,
+            iosTargetFrame: iosTargetFrame);
 
-  Map<String, dynamic> toMap() {
-    return {
-      "url": url,
-      "windowId": windowId,
-      "androidIsDialog": androidIsDialog,
-      "androidIsUserGesture": androidIsUserGesture,
-      "iosWKNavigationType": iosWKNavigationType?.toValue(),
-      "iosIsForMainFrame": iosIsForMainFrame,
-      "iosAllowsCellularAccess": iosAllowsCellularAccess,
-      "iosAllowsConstrainedNetworkAccess": iosAllowsConstrainedNetworkAccess,
-      "iosAllowsExpensiveNetworkAccess": iosAllowsExpensiveNetworkAccess,
-      "iosCachePolicy": iosCachePolicy?.toValue(),
-      "iosHttpShouldHandleCookies": iosHttpShouldHandleCookies,
-      "iosHttpShouldUsePipelining": iosHttpShouldUsePipelining,
-      "iosNetworkServiceType": iosNetworkServiceType?.toValue(),
-      "iosTimeoutInterval": iosTimeoutInterval,
-    };
+  static CreateWindowAction? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return CreateWindowAction(
+        windowId: map["windowId"],
+        androidIsDialog: map["androidIsDialog"],
+        iosWindowFeatures: IOSWKWindowFeatures.fromMap(
+            map["iosWindowFeatures"]?.cast<String, dynamic>()),
+        request: URLRequest.fromMap(map["request"].cast<String, dynamic>())!,
+        isForMainFrame: map["isForMainFrame"],
+        androidHasGesture: map["androidHasGesture"],
+        androidIsRedirect: map["androidIsRedirect"],
+        iosWKNavigationType:
+            IOSWKNavigationType.fromValue(map["iosWKNavigationType"]),
+        iosSourceFrame: IOSWKFrameInfo.fromMap(
+            map["iosSourceFrame"]?.cast<String, dynamic>()),
+        iosTargetFrame: IOSWKFrameInfo.fromMap(
+            map["iosTargetFrame"]?.cast<String, dynamic>()));
   }
 
-  Map<String, dynamic> toJson() {
-    return this.toMap();
+  @override
+  Map<String, dynamic> toMap() {
+    var createWindowActionMap = super.toMap();
+    createWindowActionMap.addAll({
+      "windowId": windowId,
+      "androidIsDialog": androidIsDialog,
+      "iosWindowFeatures": iosWindowFeatures?.toMap(),
+    });
+    return createWindowActionMap;
   }
 
   @override
@@ -3618,8 +4197,8 @@ class IOSWKWebsiteDataType {
   static IOSWKWebsiteDataType? fromValue(String? value) {
     if (value != null) {
       try {
-        return IOSWKWebsiteDataType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSWKWebsiteDataType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -3753,8 +4332,8 @@ class InAppWebViewHitTestResultType {
   static InAppWebViewHitTestResultType? fromValue(int? value) {
     if (value != null) {
       try {
-        return InAppWebViewHitTestResultType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return InAppWebViewHitTestResultType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -3834,6 +4413,16 @@ class InAppWebViewHitTestResult {
     return {"type": type?.toValue(), "extra": extra};
   }
 
+  static InAppWebViewHitTestResult? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
+    return InAppWebViewHitTestResult(
+        type: InAppWebViewHitTestResultType.fromValue(map["type"]),
+        extra: map["extra"]);
+  }
+
   Map<String, dynamic> toJson() {
     return this.toMap();
   }
@@ -3878,7 +4467,19 @@ class RenderProcessGoneDetail {
   /// any individual [WebView] requested using [].
   RendererPriority? rendererPriorityAtExit;
 
-  RenderProcessGoneDetail({required this.didCrash, this.rendererPriorityAtExit});
+  RenderProcessGoneDetail(
+      {required this.didCrash, this.rendererPriorityAtExit});
+
+  static RenderProcessGoneDetail? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return RenderProcessGoneDetail(
+      didCrash: map["didCrash"],
+      rendererPriorityAtExit:
+          RendererPriority.fromValue(map["rendererPriorityAtExit"]),
+    );
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -3912,8 +4513,8 @@ class RendererPriority {
   static RendererPriority? fromValue(int? value) {
     if (value != null) {
       try {
-        return RendererPriority.values.firstWhere(
-                (element) => element.toValue() == value);
+        return RendererPriority.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4029,7 +4630,7 @@ class FormResubmissionAction {
   }
 }
 
-///Class that represents an Android-specific class used to configure the WebView's over-scroll mode.
+///An Android-specific class used to configure the WebView's over-scroll mode.
 ///Setting the over-scroll mode of a WebView will have an effect only if the WebView is capable of scrolling.
 class AndroidOverScrollMode {
   final int _value;
@@ -4045,8 +4646,8 @@ class AndroidOverScrollMode {
   static AndroidOverScrollMode? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidOverScrollMode.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidOverScrollMode.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4085,7 +4686,7 @@ class AndroidOverScrollMode {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an Android-specific class used to configure the style of the scrollbars.
+///An Android-specific class used to configure the style of the scrollbars.
 ///The scrollbars can be overlaid or inset.
 ///When inset, they add to the padding of the view. And the scrollbars can be drawn inside the padding area or on the edge of the view.
 ///For example, if a view has a background drawable and you want to draw the scrollbars inside the padding specified by the drawable,
@@ -4107,8 +4708,8 @@ class AndroidScrollBarStyle {
   static AndroidScrollBarStyle? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidScrollBarStyle.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidScrollBarStyle.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4159,7 +4760,7 @@ class AndroidScrollBarStyle {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an Android-specific class used to configure the position of the vertical scroll bar.
+///An Android-specific class used to configure the position of the vertical scroll bar.
 class AndroidVerticalScrollbarPosition {
   final int _value;
 
@@ -4174,8 +4775,8 @@ class AndroidVerticalScrollbarPosition {
   static AndroidVerticalScrollbarPosition? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidVerticalScrollbarPosition.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidVerticalScrollbarPosition.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4250,7 +4851,7 @@ class AndroidWebViewPackageInfo {
 ///Class that represents the result used by the [InAppWebViewController.requestFocusNodeHref] method.
 class RequestFocusNodeHrefResult {
   ///The anchor's href attribute.
-  String? url;
+  Uri? url;
 
   ///The anchor's text.
   String? title;
@@ -4261,7 +4862,7 @@ class RequestFocusNodeHrefResult {
   RequestFocusNodeHrefResult({this.url, this.title, this.src});
 
   Map<String, dynamic> toMap() {
-    return {"url": url, "title": title, "src": src};
+    return {"url": url?.toString(), "title": title, "src": src};
   }
 
   Map<String, dynamic> toJson() {
@@ -4277,13 +4878,13 @@ class RequestFocusNodeHrefResult {
 ///Class that represents the result used by the [InAppWebViewController.requestImageRef] method.
 class RequestImageRefResult {
   ///The image's url.
-  String? url;
+  Uri? url;
 
   RequestImageRefResult({this.url});
 
   Map<String, dynamic> toMap() {
     return {
-      "url": url,
+      "url": url?.toString(),
     };
   }
 
@@ -4366,8 +4967,8 @@ class WebStorageType {
   static WebStorageType? fromValue(String? value) {
     if (value != null) {
       try {
-        return WebStorageType.values.firstWhere(
-                (element) => element.toValue() == value);
+        return WebStorageType.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4409,8 +5010,8 @@ class HTTPCookieSameSitePolicy {
   static HTTPCookieSameSitePolicy? fromValue(String? value) {
     if (value != null) {
       try {
-        return HTTPCookieSameSitePolicy.values.firstWhere(
-                (element) => element.toValue() == value);
+        return HTTPCookieSameSitePolicy.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4465,8 +5066,8 @@ class AndroidSslError {
   static AndroidSslError? fromValue(int? value) {
     if (value != null) {
       try {
-        return AndroidSslError.values.firstWhere(
-                (element) => element.toValue() == value);
+        return AndroidSslError.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4538,8 +5139,8 @@ class IOSSslError {
   static IOSSslError? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSSslError.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSSslError.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4592,7 +5193,7 @@ class IOSSslError {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents an iOS-specific class used to configure how safe area insets are added to the adjusted content inset.
+///An iOS-specific class used to configure how safe area insets are added to the adjusted content inset.
 ///
 ///**NOTE**: available on iOS 11.0+.
 class IOSUIScrollViewContentInsetAdjustmentBehavior {
@@ -4610,8 +5211,8 @@ class IOSUIScrollViewContentInsetAdjustmentBehavior {
   static IOSUIScrollViewContentInsetAdjustmentBehavior? fromValue(int? value) {
     if (value != null) {
       try {
-        return IOSUIScrollViewContentInsetAdjustmentBehavior.values.firstWhere(
-                (element) => element.toValue() == value);
+        return IOSUIScrollViewContentInsetAdjustmentBehavior.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4660,16 +5261,16 @@ class IOSUIScrollViewContentInsetAdjustmentBehavior {
 
 ///SSL certificate info (certificate details) class.
 class SslCertificate {
-  ///Name of the entity this certificate is issued by
+  ///Name of the entity this certificate is issued by.
   SslCertificateDName? issuedBy;
 
-  ///Name of the entity this certificate is issued to
+  ///Name of the entity this certificate is issued to.
   SslCertificateDName? issuedTo;
 
-  ///Not-after date from the validity period
+  ///Not-after date from the validity period.
   DateTime? validNotAfterDate;
 
-  ///Not-before date from the validity period
+  ///Not-before date from the validity period.
   DateTime? validNotBeforeDate;
 
   ///The original source certificate, if available.
@@ -4683,27 +5284,62 @@ class SslCertificate {
       this.x509Certificate});
 
   static SslCertificate? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+
     X509Certificate? x509Certificate;
     try {
-      x509Certificate = map != null ? X509Certificate.fromData(data: map["x509Certificate"]) : null;
+      x509Certificate = X509Certificate.fromData(data: map["x509Certificate"]);
     } catch (e, stacktrace) {
       print(e);
       print(stacktrace);
     }
 
-    return map != null
-        ? SslCertificate(
-            issuedBy: SslCertificateDName.fromMap(
-                map["issuedBy"]?.cast<String, dynamic>()),
-            issuedTo: SslCertificateDName.fromMap(
-                map["issuedTo"]?.cast<String, dynamic>()),
-            validNotAfterDate:
-                DateTime.fromMillisecondsSinceEpoch(map["validNotAfterDate"]),
-            validNotBeforeDate:
-                DateTime.fromMillisecondsSinceEpoch(map["validNotBeforeDate"]),
-            x509Certificate: x509Certificate,
-          )
-        : null;
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      if (x509Certificate != null) {
+        return SslCertificate(
+          issuedBy: SslCertificateDName(
+              CName: x509Certificate.issuer(
+                      dn: ASN1DistinguishedNames.COMMON_NAME) ??
+                  "",
+              DName: x509Certificate.issuerDistinguishedName ?? "",
+              OName: x509Certificate.issuer(
+                      dn: ASN1DistinguishedNames.ORGANIZATION_NAME) ??
+                  "",
+              UName: x509Certificate.issuer(
+                      dn: ASN1DistinguishedNames.ORGANIZATIONAL_UNIT_NAME) ??
+                  ""),
+          issuedTo: SslCertificateDName(
+              CName: x509Certificate.subject(
+                      dn: ASN1DistinguishedNames.COMMON_NAME) ??
+                  "",
+              DName: x509Certificate.subjectDistinguishedName ?? "",
+              OName: x509Certificate.subject(
+                      dn: ASN1DistinguishedNames.ORGANIZATION_NAME) ??
+                  "",
+              UName: x509Certificate.subject(
+                      dn: ASN1DistinguishedNames.ORGANIZATIONAL_UNIT_NAME) ??
+                  ""),
+          validNotAfterDate: x509Certificate.notAfter,
+          validNotBeforeDate: x509Certificate.notBefore,
+          x509Certificate: x509Certificate,
+        );
+      }
+      return null;
+    }
+
+    return SslCertificate(
+      issuedBy:
+          SslCertificateDName.fromMap(map["issuedBy"]?.cast<String, dynamic>()),
+      issuedTo:
+          SslCertificateDName.fromMap(map["issuedTo"]?.cast<String, dynamic>()),
+      validNotAfterDate:
+          DateTime.fromMillisecondsSinceEpoch(map["validNotAfterDate"]),
+      validNotBeforeDate:
+          DateTime.fromMillisecondsSinceEpoch(map["validNotBeforeDate"]),
+      x509Certificate: x509Certificate,
+    );
   }
 
   Map<String, dynamic> toMap() {
@@ -4798,6 +5434,17 @@ class LoginRequest {
 
   LoginRequest({required this.realm, this.account, required this.args});
 
+  static LoginRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return LoginRequest(
+      realm: map["realm"],
+      account: map["account"],
+      args: map["args"],
+    );
+  }
+
   Map<String, dynamic> toMap() {
     return {"realm": realm, "account": account, "args": args};
   }
@@ -4826,8 +5473,8 @@ class UserScriptInjectionTime {
   static UserScriptInjectionTime? fromValue(int? value) {
     if (value != null) {
       try {
-        return UserScriptInjectionTime.values.firstWhere(
-                (element) => element.toValue() == value);
+        return UserScriptInjectionTime.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -4851,14 +5498,12 @@ class UserScriptInjectionTime {
   ///**NOTE for iOS**: A constant to inject the script after the creation of the webpage’s document element, but before loading any other content.
   ///
   ///**NOTE for Android**: A constant to try to inject the script as soon as the page starts loading.
-  static const AT_DOCUMENT_START =
-  const UserScriptInjectionTime._internal(0);
+  static const AT_DOCUMENT_START = const UserScriptInjectionTime._internal(0);
 
   ///**NOTE for iOS**: A constant to inject the script after the document finishes loading, but before loading any other subresources.
   ///
   ///**NOTE for Android**: A constant to inject the script as soon as the page finishes loading.
-  static const AT_DOCUMENT_END =
-  const UserScriptInjectionTime._internal(1);
+  static const AT_DOCUMENT_END = const UserScriptInjectionTime._internal(1);
 
   bool operator ==(value) => value == _value;
 
@@ -4868,6 +5513,9 @@ class UserScriptInjectionTime {
 
 ///Class that represents a script that the [WebView] injects into the web page.
 class UserScript {
+  ///The script’s group name.
+  String? groupName;
+
   ///The script’s source code.
   String source;
 
@@ -4881,19 +5529,26 @@ class UserScript {
   ///**NOTE**: available only on iOS.
   bool iosForMainFrameOnly;
 
-  ///**NOTE for iOS 14.0+**: The namespace in which to evaluate the script.
-  ///This parameter doesn’t apply to changes your script makes to the underlying web content, such as the document’s DOM structure.
-  ///Those changes remain visible to all scripts, regardless of which content world you specify.
-  ///For more information about content worlds, see [WKContentWorld](https://developer.apple.com/documentation/webkit/wkcontentworld).
-  ContentWorld? contentWorld;
+  ///A scope of execution in which to evaluate the script to prevent conflicts between different scripts.
+  ///For more information about content worlds, see [ContentWorld].
+  late ContentWorld contentWorld;
 
-  UserScript({required this.source, required this.injectionTime, this.iosForMainFrameOnly = true, this.contentWorld});
+  UserScript(
+      {this.groupName,
+      required this.source,
+      required this.injectionTime,
+      this.iosForMainFrameOnly = true,
+      ContentWorld? contentWorld}) {
+    this.contentWorld = contentWorld ?? ContentWorld.PAGE;
+  }
 
   Map<String, dynamic> toMap() {
-    return {"source": source,
+    return {
+      "groupName": groupName,
+      "source": source,
       "injectionTime": injectionTime.toValue(),
       "iosForMainFrameOnly": iosForMainFrameOnly,
-      "contentWorld": contentWorld?.name
+      "contentWorld": contentWorld.toMap()
     };
   }
 
@@ -4907,32 +5562,42 @@ class UserScript {
   }
 }
 
-///Class that represents an object that defines a scope of execution for JavaScript code, and which you use to prevent conflicts between different scripts.
+final _contentWorldNameRegExp = RegExp(r'[\s]');
+
+///Class that represents an object that defines a scope of execution for JavaScript code and which you use to prevent conflicts between different scripts.
 ///
 ///**NOTE for iOS**: available on iOS 14.0+. This class represents the native [WKContentWorld](https://developer.apple.com/documentation/webkit/wkcontentworld) class.
 ///
-///**NOTE for Android**: it will create and append an `<iframe>` HTML element with `id` equals to `flutter_inappwebview_[name]`
+///**NOTE for Android**: it will create and append an `<iframe>` HTML element with `id` attribute equals to `flutter_inappwebview_[name]`
 ///to the webpage's content that contains only the inline `<script>` HTML elements in order to define a new scope of execution for JavaScript code.
 ///Unfortunately, there isn't any other way to do it.
 ///There are some limitations:
-///- for any [ContentWorld], except [ContentWorld.page] (that is the webpage itself), if you need to access to the `window` or `document` global Object,
+///- for any [ContentWorld], except [ContentWorld.PAGE] (that is the webpage itself), if you need to access to the `window` or `document` global Object,
 ///you need to use `window.top` and `window.top.document` because the code runs inside an `<iframe>`;
 ///- also, the execution of the inline `<script>` could be blocked by the `Content-Security-Policy` header.
 class ContentWorld {
   ///The name of a custom content world.
+  ///It cannot contain space characters.
   final String name;
 
   ///Returns the custom content world with the specified name.
-  ContentWorld.world({required this.name});
+  ContentWorld.world({required this.name}) {
+    // WINDOW-ID- is used internally by the plugin!
+    assert(!this.name.startsWith("WINDOW-ID-") &&
+        !this.name.contains(_contentWorldNameRegExp));
+  }
 
   ///The default world for clients.
-  static ContentWorld defaultClient = ContentWorld.world(name: "defaultClient");
+  // ignore: non_constant_identifier_names
+  static final ContentWorld DEFAULT_CLIENT =
+      ContentWorld.world(name: "defaultClient");
 
   ///The content world for the current webpage’s content.
   ///This property contains the content world for scripts that the current webpage executes.
   ///Be careful when manipulating variables in this content world.
   ///If you modify a variable with the same name as one the webpage uses, you may unintentionally disrupt the normal operation of that page.
-  static ContentWorld page = ContentWorld.world(name: "page");
+  // ignore: non_constant_identifier_names
+  static final ContentWorld PAGE = ContentWorld.world(name: "page");
 
   Map<String, dynamic> toMap() {
     return {"name": name};
@@ -4954,7 +5619,7 @@ class CallAsyncJavaScriptResult {
   dynamic value;
 
   ///It contains the failure value.
-  dynamic error;
+  String? error;
 
   CallAsyncJavaScriptResult({this.value, this.error});
 
@@ -4976,14 +5641,21 @@ class CallAsyncJavaScriptResult {
 class InAppWebViewRect {
   ///
   double x;
+
   ///
   double y;
+
   ///
   double width;
+
   ///
   double height;
 
-  InAppWebViewRect({required this.x, required this.y, required this.width, required this.height}) {
+  InAppWebViewRect(
+      {required this.x,
+      required this.y,
+      required this.width,
+      required this.height}) {
     assert(this.x >= 0 && this.y >= 0 && this.width >= 0 && this.height >= 0);
   }
 
@@ -5018,8 +5690,8 @@ class CompressFormat {
   static CompressFormat? fromValue(String? value) {
     if (value != null) {
       try {
-        return CompressFormat.values.firstWhere(
-                (element) => element.toValue() == value);
+        return CompressFormat.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -5073,7 +5745,6 @@ class CompressFormat {
   int get hashCode => _value.hashCode;
 }
 
-
 ///Class that represents the configuration data to use when generating an image from a web view’s contents using [InAppWebViewController.takeScreenshot].
 ///
 ///**NOTE for iOS**: available from iOS 11.0+.
@@ -5107,12 +5778,12 @@ class ScreenshotConfiguration {
   ///**NOTE for iOS**: available only on iOS. Available from iOS 13.0+.
   bool iosAfterScreenUpdates;
 
-  ScreenshotConfiguration({
-    this.rect,
-    this.snapshotWidth,
-    this.compressFormat = CompressFormat.PNG,
-    this.quality = 100,
-    this.iosAfterScreenUpdates = true}) {
+  ScreenshotConfiguration(
+      {this.rect,
+      this.snapshotWidth,
+      this.compressFormat = CompressFormat.PNG,
+      this.quality = 100,
+      this.iosAfterScreenUpdates = true}) {
     assert(this.quality >= 0);
   }
 
@@ -5122,7 +5793,8 @@ class ScreenshotConfiguration {
       "snapshotWidth": snapshotWidth,
       "compressFormat": compressFormat.toValue(),
       "quality": quality,
-      "iosAfterScreenUpdates": iosAfterScreenUpdates};
+      "iosAfterScreenUpdates": iosAfterScreenUpdates
+    };
   }
 
   Map<String, dynamic> toJson() {
@@ -5144,13 +5816,10 @@ class IOSWKPDFConfiguration {
   ///If you specify a custom rectangle, it must lie within the bounds rectangle of the [WebView] object.
   InAppWebViewRect? rect;
 
-  IOSWKPDFConfiguration({
-    this.rect});
+  IOSWKPDFConfiguration({this.rect});
 
   Map<String, dynamic> toMap() {
-    return {
-      "rect": rect?.toMap()
-    };
+    return {"rect": rect?.toMap()};
   }
 
   Map<String, dynamic> toJson() {
@@ -5169,16 +5838,14 @@ class WebArchiveFormat {
 
   const WebArchiveFormat._internal(this._value);
 
-  static final Set<WebArchiveFormat> values = [
-    WebArchiveFormat.MHT,
-    WebArchiveFormat.WEBARCHIVE
-  ].toSet();
+  static final Set<WebArchiveFormat> values =
+      [WebArchiveFormat.MHT, WebArchiveFormat.WEBARCHIVE].toSet();
 
   static WebArchiveFormat? fromValue(String? value) {
     if (value != null) {
       try {
-        return WebArchiveFormat.values.firstWhere(
-                (element) => element.toValue() == value);
+        return WebArchiveFormat.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -5203,22 +5870,24 @@ class WebArchiveFormat {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents the `crossorigin` content attribute on media elements is a CORS settings attribute.
-class CrossOriginHtmlAttribute {
+///Class that represents the `crossorigin` content attribute on media elements, which is a CORS settings attribute.
+///It could be used with [ScriptHtmlTagAttributes] and [CSSLinkHtmlTagAttributes]
+///when fetching a resource `<link>` or a `<script>` (or resources fetched by the `<script>`).
+class CrossOrigin {
   final String _value;
 
-  const CrossOriginHtmlAttribute._internal(this._value);
+  const CrossOrigin._internal(this._value);
 
-  static final Set<CrossOriginHtmlAttribute> values = [
-    CrossOriginHtmlAttribute.ANONYMOUS,
-    CrossOriginHtmlAttribute.USE_CREDENTIALS,
+  static final Set<CrossOrigin> values = [
+    CrossOrigin.ANONYMOUS,
+    CrossOrigin.USE_CREDENTIALS,
   ].toSet();
 
-  static CrossOriginHtmlAttribute? fromValue(String? value) {
+  static CrossOrigin? fromValue(String? value) {
     if (value != null) {
       try {
-        return CrossOriginHtmlAttribute.values.firstWhere(
-                (element) => element.toValue() == value);
+        return CrossOrigin.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -5232,10 +5901,10 @@ class CrossOriginHtmlAttribute {
   String toString() => _value;
 
   ///CORS requests for this element will have the credentials flag set to 'same-origin'.
-  static const ANONYMOUS = const CrossOriginHtmlAttribute._internal("anonymous");
+  static const ANONYMOUS = const CrossOrigin._internal("anonymous");
 
   ///CORS requests for this element will have the credentials flag set to 'include'.
-  static const USE_CREDENTIALS = const CrossOriginHtmlAttribute._internal("use-credentials");
+  static const USE_CREDENTIALS = const CrossOrigin._internal("use-credentials");
 
   bool operator ==(value) => value == _value;
 
@@ -5243,29 +5912,30 @@ class CrossOriginHtmlAttribute {
   int get hashCode => _value.hashCode;
 }
 
-///Class that represents which Referrer header to send when fetching a resource `<link>` or a `<script>` (or resources fetched by the `<script>`).
-///Used by [ScriptHtmlTagAttributes] and [CSSLinkHtmlTagAttributes].
-class ReferrerPolicyHtmlAttribute {
+///Class that represents a Referrer-Policy HTTP header.
+///It could be used with [ScriptHtmlTagAttributes] and [CSSLinkHtmlTagAttributes]
+///when fetching a resource `<link>` or a `<script>` (or resources fetched by the `<script>`).
+class ReferrerPolicy {
   final String _value;
 
-  const ReferrerPolicyHtmlAttribute._internal(this._value);
+  const ReferrerPolicy._internal(this._value);
 
-  static final Set<ReferrerPolicyHtmlAttribute> values = [
-    ReferrerPolicyHtmlAttribute.NO_REFERRER,
-    ReferrerPolicyHtmlAttribute.NO_REFERRER_WHEN_DOWNGRADE,
-    ReferrerPolicyHtmlAttribute.ORIGIN,
-    ReferrerPolicyHtmlAttribute.ORIGIN_WHEN_CROSS_ORIGIN,
-    ReferrerPolicyHtmlAttribute.SAME_ORIGIN,
-    ReferrerPolicyHtmlAttribute.STRICT_ORIGIN,
-    ReferrerPolicyHtmlAttribute.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
-    ReferrerPolicyHtmlAttribute.UNSAFE_URL,
+  static final Set<ReferrerPolicy> values = [
+    ReferrerPolicy.NO_REFERRER,
+    ReferrerPolicy.NO_REFERRER_WHEN_DOWNGRADE,
+    ReferrerPolicy.ORIGIN,
+    ReferrerPolicy.ORIGIN_WHEN_CROSS_ORIGIN,
+    ReferrerPolicy.SAME_ORIGIN,
+    ReferrerPolicy.STRICT_ORIGIN,
+    ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+    ReferrerPolicy.UNSAFE_URL,
   ].toSet();
 
-  static ReferrerPolicyHtmlAttribute? fromValue(String? value) {
+  static ReferrerPolicy? fromValue(String? value) {
     if (value != null) {
       try {
-        return ReferrerPolicyHtmlAttribute.values.firstWhere(
-                (element) => element.toValue() == value);
+        return ReferrerPolicy.values
+            .firstWhere((element) => element.toValue() == value);
       } catch (e) {
         return null;
       }
@@ -5279,32 +5949,35 @@ class ReferrerPolicyHtmlAttribute {
   String toString() => _value;
 
   ///The Referer header will not be sent.
-  static const NO_REFERRER = const ReferrerPolicyHtmlAttribute._internal("no-referrer");
+  static const NO_REFERRER = const ReferrerPolicy._internal("no-referrer");
 
   ///The Referer header will not be sent to origins without TLS (HTTPS).
-  static const NO_REFERRER_WHEN_DOWNGRADE = const ReferrerPolicyHtmlAttribute._internal("no-referrer-when-downgrade");
+  static const NO_REFERRER_WHEN_DOWNGRADE =
+      const ReferrerPolicy._internal("no-referrer-when-downgrade");
 
   ///The sent referrer will be limited to the origin of the referring page: its scheme, host, and port.
-  static const ORIGIN = const ReferrerPolicyHtmlAttribute._internal("origin");
+  static const ORIGIN = const ReferrerPolicy._internal("origin");
 
   ///The referrer sent to other origins will be limited to the scheme, the host, and the port.
   ///Navigations on the same origin will still include the path.
-  static const ORIGIN_WHEN_CROSS_ORIGIN = const ReferrerPolicyHtmlAttribute._internal("origin-when-cross-origin");
+  static const ORIGIN_WHEN_CROSS_ORIGIN =
+      const ReferrerPolicy._internal("origin-when-cross-origin");
 
   ///A referrer will be sent for same origin, but cross-origin requests will contain no referrer information.
-  static const SAME_ORIGIN = const ReferrerPolicyHtmlAttribute._internal("same-origin");
+  static const SAME_ORIGIN = const ReferrerPolicy._internal("same-origin");
 
   ///Only send the origin of the document as the referrer when the protocol security level stays the same (e.g. HTTPS -> HTTPS),
   ///but don't send it to a less secure destination (e.g. HTTPS -> HTTP).
-  static const STRICT_ORIGIN = const ReferrerPolicyHtmlAttribute._internal("strict-origin");
+  static const STRICT_ORIGIN = const ReferrerPolicy._internal("strict-origin");
 
   ///Send a full URL when performing a same-origin request, but only send the origin when the protocol security level stays the same (e.g.HTTPS -> HTTPS),
   ///and send no header to a less secure destination (e.g. HTTPS -> HTTP).
-  static const STRICT_ORIGIN_WHEN_CROSS_ORIGIN = const ReferrerPolicyHtmlAttribute._internal("strict-origin-when-cross-origin");
+  static const STRICT_ORIGIN_WHEN_CROSS_ORIGIN =
+      const ReferrerPolicy._internal("strict-origin-when-cross-origin");
 
   ///The referrer will include the origin and the path (but not the fragment, password, or username).
   ///This value is unsafe, because it leaks origins and paths from TLS-protected resources to insecure origins.
-  static const UNSAFE_URL = const ReferrerPolicyHtmlAttribute._internal("unsafe-url");
+  static const UNSAFE_URL = const ReferrerPolicy._internal("unsafe-url");
 
   bool operator ==(value) => value == _value;
 
@@ -5314,7 +5987,6 @@ class ReferrerPolicyHtmlAttribute {
 
 ///Class that represents the possible the `<script>` HTML attributes to be set used by [InAppWebViewController.injectJavascriptFileFromUrl].
 class ScriptHtmlTagAttributes {
-  
   ///This attribute indicates the type of script represented. The value of this attribute will be in one of the following categories.
   ///The default value is `text/javascript`.
   String type;
@@ -5348,7 +6020,7 @@ class ScriptHtmlTagAttributes {
 
   ///Normal script elements pass minimal information to the `window.onerror` for scripts which do not pass the standard CORS checks.
   ///To allow error logging for sites which use a separate domain for static media, use this attribute.
-  CrossOriginHtmlAttribute? crossOrigin;
+  CrossOrigin? crossOrigin;
 
   ///This attribute contains inline metadata that a user agent can use to verify that a fetched resource has been delivered free of unexpected manipulation.
   String? integrity;
@@ -5363,9 +6035,35 @@ class ScriptHtmlTagAttributes {
   String? nonce;
 
   ///Indicates which referrer to send when fetching the script, or resources fetched by the script.
-  ReferrerPolicyHtmlAttribute? referrerPolicy;
+  ReferrerPolicy? referrerPolicy;
 
-  ScriptHtmlTagAttributes({this.type = "text/javascript", this.id, this.async, this.defer, this.crossOrigin, this.integrity, this.noModule, this.nonce, this.referrerPolicy});
+  ///Represents a callback function that will be called as soon as the script has been loaded successfully.
+  ///
+  ///**NOTE**: This callback requires the [id] property to be set.
+  Function()? onLoad;
+
+  ///Represents a callback function that will be called if an error occurred while trying to load the script.
+  ///
+  ///**NOTE**: This callback requires the [id] property to be set.
+  Function()? onError;
+
+  ScriptHtmlTagAttributes(
+      {this.type = "text/javascript",
+      this.id,
+      this.async,
+      this.defer,
+      this.crossOrigin,
+      this.integrity,
+      this.noModule,
+      this.nonce,
+      this.referrerPolicy,
+      this.onLoad,
+      this.onError}) {
+    if (this.onLoad != null || this.onError != null) {
+      assert(this.id != null,
+          'onLoad and onError callbacks require the id property to be set.');
+    }
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -5393,7 +6091,6 @@ class ScriptHtmlTagAttributes {
 
 ///Class that represents the possible CSS stylesheet `<link>` HTML attributes to be set used by [InAppWebViewController.injectCSSFileFromUrl].
 class CSSLinkHtmlTagAttributes {
-
   ///The HTML [id] attribute is used to specify a unique id for the `<link>` HTML element.
   String? id;
 
@@ -5403,13 +6100,13 @@ class CSSLinkHtmlTagAttributes {
 
   ///Normal script elements pass minimal information to the `window.onerror` for scripts which do not pass the standard CORS checks.
   ///To allow error logging for sites which use a separate domain for static media, use this attribute.
-  CrossOriginHtmlAttribute? crossOrigin;
+  CrossOrigin? crossOrigin;
 
   ///This attribute contains inline metadata that a user agent can use to verify that a fetched resource has been delivered free of unexpected manipulation.
   String? integrity;
 
   ///Indicates which referrer to send when fetching the script, or resources fetched by the script.
-  ReferrerPolicyHtmlAttribute? referrerPolicy;
+  ReferrerPolicy? referrerPolicy;
 
   ///The [disabled] Boolean attribute indicates whether or not the described stylesheet should be loaded and applied to the document.
   ///If [disabled] is specified in the HTML when it is loaded, the stylesheet will not be loaded during page load.
@@ -5426,7 +6123,15 @@ class CSSLinkHtmlTagAttributes {
   ///Incorrectly using it may cause the stylesheet to be ignored.
   String? title;
 
-  CSSLinkHtmlTagAttributes({this.id, this.media, this.crossOrigin, this.integrity, this.referrerPolicy, this.disabled, this.alternate, this.title});
+  CSSLinkHtmlTagAttributes(
+      {this.id,
+      this.media,
+      this.crossOrigin,
+      this.integrity,
+      this.referrerPolicy,
+      this.disabled,
+      this.alternate,
+      this.title});
 
   Map<String, dynamic> toMap() {
     return {
@@ -5451,17 +6156,9 @@ class CSSLinkHtmlTagAttributes {
   }
 }
 
-///An iOS-specific Class that represents the navigation response used by the [WebView.iosOnNavigationResponse] event.
-class IOSNavigationResponse {
-
+class IOSURLResponse {
   ///The URL for the response.
-  String? url;
-
-  ///A Boolean value that indicates whether the response targets the web view’s main frame.
-  bool isForMainFrame;
-
-  ///A Boolean value that indicates whether WebKit is capable of displaying the response’s MIME type natively.
-  bool canShowMIMEType;
+  Uri? url;
 
   ///The expected length of the response’s content.
   int expectedContentLength;
@@ -5475,24 +6172,90 @@ class IOSNavigationResponse {
   ///The name of the text encoding provided by the response’s originating source.
   String? textEncodingName;
 
-  IOSNavigationResponse({this.url,
-    required this.isForMainFrame,
-    required this.canShowMIMEType,
-    required this.expectedContentLength,
-    this.mimeType,
-    this.suggestedFilename,
-    this.textEncodingName
-  });
+  ///All HTTP header fields of the response.
+  Map<String, String>? headers;
+
+  ///The response’s HTTP status code.
+  int? statusCode;
+
+  IOSURLResponse(
+      {this.url,
+      required this.expectedContentLength,
+      this.mimeType,
+      this.suggestedFilename,
+      this.textEncodingName,
+      this.headers,
+      this.statusCode});
+
+  static IOSURLResponse? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return IOSURLResponse(
+        url: map["url"] != null ? Uri.parse(map["url"]) : null,
+        expectedContentLength: map["expectedContentLength"],
+        mimeType: map["mimeType"],
+        suggestedFilename: map["suggestedFilename"],
+        textEncodingName: map["textEncodingName"],
+        headers: map["headers"]?.cast<String, String>(),
+        statusCode: map["statusCode"]);
+  }
 
   Map<String, dynamic> toMap() {
     return {
-      "url": this.url,
-      "isForMainFrame": this.isForMainFrame,
-      "canShowMIMEType": this.canShowMIMEType,
-      "expectedContentLength": this.expectedContentLength,
-      "mimeType": this.mimeType,
-      "suggestedFilename": this.suggestedFilename,
-      "textEncodingName": this.textEncodingName,
+      "url": url?.toString(),
+      "expectedContentLength": expectedContentLength,
+      "mimeType": mimeType,
+      "suggestedFilename": suggestedFilename,
+      "textEncodingName": textEncodingName,
+      "headers": headers,
+      "statusCode": statusCode
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///An iOS-specific Class that represents the navigation response used by the [WebView.iosOnNavigationResponse] event.
+class IOSWKNavigationResponse {
+  ///The URL for the response.
+  IOSURLResponse? response;
+
+  ///A Boolean value that indicates whether the response targets the web view’s main frame.
+  bool isForMainFrame;
+
+  ///A Boolean value that indicates whether WebKit is capable of displaying the response’s MIME type natively.
+  bool canShowMIMEType;
+
+  IOSWKNavigationResponse(
+      {this.response,
+      required this.isForMainFrame,
+      required this.canShowMIMEType});
+
+  static IOSWKNavigationResponse? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return IOSWKNavigationResponse(
+      response:
+          IOSURLResponse.fromMap(map["response"]?.cast<String, dynamic>()),
+      isForMainFrame: map["isForMainFrame"],
+      canShowMIMEType: map["canShowMIMEType"],
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      "response": response?.toMap(),
+      "isForMainFrame": isForMainFrame,
+      "canShowMIMEType": canShowMIMEType,
     };
   }
 
@@ -5558,4 +6321,532 @@ class IOSShouldAllowDeprecatedTLSAction {
       "action": _value,
     };
   }
+}
+
+///A URL load request that is independent of protocol or URL scheme.
+class URLRequest {
+  ///The URL of the request.
+  Uri? url;
+
+  ///The HTTP request method.
+  ///
+  ///**NOTE for Android**: it supports only "GET" and "POST" methods.
+  String? method;
+
+  ///The data sent as the message body of a request, such as for an HTTP POST request.
+  Uint8List? body;
+
+  ///A dictionary containing all of the HTTP header fields for a request.
+  Map<String, String>? headers;
+
+  ///A Boolean value indicating whether the request is allowed to use the built-in cellular radios to satisfy the request.
+  ///
+  ///**NOTE**: available only on iOS.
+  bool? iosAllowsCellularAccess;
+
+  ///A Boolean value that indicates whether the request may use the network when the user has specified Low Data Mode.
+  ///
+  ///**NOTE**: available only on iOS 13.0+.
+  bool? iosAllowsConstrainedNetworkAccess;
+
+  ///A Boolean value that indicates whether connections may use a network interface that the system considers expensive.
+  ///
+  ///**NOTE**: available only on iOS 13.0+.
+  bool? iosAllowsExpensiveNetworkAccess;
+
+  ///The request’s cache policy.
+  ///
+  ///**NOTE**: available only on iOS.
+  IOSURLRequestCachePolicy? iosCachePolicy;
+
+  ///A Boolean value indicating whether cookies will be sent with and set for this request.
+  ///
+  ///**NOTE**: available only on iOS.
+  bool? iosHttpShouldHandleCookies;
+
+  ///A Boolean value indicating whether the request should transmit before the previous response is received.
+  ///
+  ///**NOTE**: available only on iOS.
+  bool? iosHttpShouldUsePipelining;
+
+  ///The service type associated with this request.
+  ///
+  ///**NOTE**: available only on iOS.
+  IOSURLRequestNetworkServiceType? iosNetworkServiceType;
+
+  ///The timeout interval of the request.
+  ///
+  ///**NOTE**: available only on iOS.
+  double? iosTimeoutInterval;
+
+  ///The main document URL associated with this request.
+  ///This URL is used for the cookie “same domain as main document” policy.
+  ///
+  ///**NOTE**: available only on iOS.
+  Uri? iosMainDocumentURL;
+
+  URLRequest(
+      {required this.url,
+      this.method,
+      this.headers,
+      this.body,
+      this.iosAllowsCellularAccess,
+      this.iosAllowsConstrainedNetworkAccess,
+      this.iosAllowsExpensiveNetworkAccess,
+      this.iosCachePolicy,
+      this.iosHttpShouldHandleCookies,
+      this.iosHttpShouldUsePipelining,
+      this.iosNetworkServiceType,
+      this.iosTimeoutInterval,
+      this.iosMainDocumentURL});
+
+  static URLRequest? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return URLRequest(
+      url: map["url"] != null ? Uri.parse(map["url"]) : null,
+      headers: map["headers"]?.cast<String, String>(),
+      method: map["method"],
+      body: map["body"],
+      iosAllowsCellularAccess: map["iosAllowsCellularAccess"],
+      iosAllowsConstrainedNetworkAccess:
+          map["iosAllowsConstrainedNetworkAccess"],
+      iosAllowsExpensiveNetworkAccess: map["iosAllowsExpensiveNetworkAccess"],
+      iosCachePolicy: IOSURLRequestCachePolicy.fromValue(map["iosCachePolicy"]),
+      iosHttpShouldHandleCookies: map["iosHttpShouldHandleCookies"],
+      iosHttpShouldUsePipelining: map["iosHttpShouldUsePipelining"],
+      iosNetworkServiceType: IOSURLRequestNetworkServiceType.fromValue(
+          map["iosNetworkServiceType"]),
+      iosTimeoutInterval: map["iosTimeoutInterval"],
+      iosMainDocumentURL: map["iosMainDocumentURL"] != null
+          ? Uri.parse(map["iosMainDocumentURL"])
+          : null,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      "url": url?.toString(),
+      "headers": headers,
+      "method": method,
+      "body": body,
+      "iosAllowsCellularAccess": iosAllowsCellularAccess,
+      "iosAllowsConstrainedNetworkAccess": iosAllowsConstrainedNetworkAccess,
+      "iosAllowsExpensiveNetworkAccess": iosAllowsExpensiveNetworkAccess,
+      "iosCachePolicy": iosCachePolicy?.toValue(),
+      "iosHttpShouldHandleCookies": iosHttpShouldHandleCookies,
+      "iosHttpShouldUsePipelining": iosHttpShouldUsePipelining,
+      "iosNetworkServiceType": iosNetworkServiceType?.toValue(),
+      "iosTimeoutInterval": iosTimeoutInterval,
+      "iosMainDocumentURL": iosMainDocumentURL?.toString(),
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///An iOS-specific class that specifies optional attributes for the containing window when a new web view is requested.
+class IOSWKWindowFeatures {
+  ///A Boolean value indicating whether the containing window should be resizable, or `null` if resizability is not specified.
+  bool? allowsResizing;
+
+  ///A Double value specifying the height of the containing window, or `null` if the height is not specified.
+  double? height;
+
+  ///A Boolean value indicating whether the menu bar should be visible, or `null` if menu bar visibility is not specified.
+  bool? menuBarVisibility;
+
+  ///A Boolean value indicating whether the status bar should be visible, or `null` if status bar visibility is not specified.
+  bool? statusBarVisibility;
+
+  ///A Boolean value indicating whether toolbars should be visible, or `null` if toolbars visibility is not specified.
+  bool? toolbarsVisibility;
+
+  ///A Double value specifying the width of the containing window, or `null` if the width is not specified.
+  double? width;
+
+  ///A Double value specifying the x-coordinate of the containing window, or `null` if the x-coordinate is not specified.
+  double? x;
+
+  ///A Double value specifying the y-coordinate of the containing window, or `null` if the y-coordinate is not specified.
+  double? y;
+
+  IOSWKWindowFeatures(
+      {this.allowsResizing,
+      this.height,
+      this.menuBarVisibility,
+      this.statusBarVisibility,
+      this.toolbarsVisibility,
+      this.width,
+      this.x,
+      this.y});
+
+  static IOSWKWindowFeatures? fromMap(Map<String, dynamic>? map) {
+    if (map == null) {
+      return null;
+    }
+    return IOSWKWindowFeatures(
+        allowsResizing: map["allowsResizing"],
+        height: map["height"],
+        menuBarVisibility: map["menuBarVisibility"],
+        statusBarVisibility: map["statusBarVisibility"],
+        toolbarsVisibility: map["toolbarsVisibility"],
+        width: map["width"],
+        x: map["x"],
+        y: map["y"]);
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      "allowsResizing": allowsResizing,
+      "height": height,
+      "menuBarVisibility": menuBarVisibility,
+      "statusBarVisibility": statusBarVisibility,
+      "toolbarsVisibility": toolbarsVisibility,
+      "width": width,
+      "x": x,
+      "y": y,
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///An iOS-specific class that represents a string with associated attributes
+///used by the [PullToRefreshController] and [PullToRefreshOptions] classes.
+class IOSNSAttributedString {
+  ///The characters for the new object.
+  String string;
+
+  ///The color of the background behind the text.
+  ///
+  ///The value of this attribute is a [Color] object.
+  ///Use this attribute to specify the color of the background area behind the text.
+  ///If you do not specify this attribute, no background color is drawn.
+  Color? backgroundColor;
+
+  ///The vertical offset for the position of the text.
+  ///
+  ///The value of this attribute is a number containing a floating point value indicating the character’s offset from the baseline, in points.
+  ///The default value is `0`.
+  double? baselineOffset;
+
+  ///The expansion factor of the text.
+  ///
+  ///The value of this attribute is a number containing a floating point value indicating the log of the expansion factor to be applied to glyphs.
+  ///The default value is `0`, indicating no expansion.
+  double? expansion;
+
+  ///The color of the text.
+  ///
+  ///The value of this attribute is a [Color] object.
+  ///Use this attribute to specify the color of the text during rendering.
+  ///If you do not specify this attribute, the text is rendered in black.
+  Color? foregroundColor;
+
+  ///The kerning of the text.
+  ///
+  ///The value of this attribute is a number containing a floating-point value.
+  ///This value specifies the number of points by which to adjust kern-pair characters.
+  ///Kerning prevents unwanted space from occurring between specific characters and depends on the font.
+  ///The value `0` means kerning is disabled. The default value for this attribute is `0`.
+  double? kern;
+
+  ///The ligature of the text.
+  ///
+  ///The value of this attribute is a number containing an integer.
+  ///Ligatures cause specific character combinations to be rendered using a single custom glyph that corresponds to those characters.
+  ///The value `0` indicates no ligatures. The value `1` indicates the use of the default ligatures.
+  ///The value `2` indicates the use of all ligatures.
+  ///The default value for this attribute is `1`. (Value `2` is unsupported on iOS.)
+  int? ligature;
+
+  ///The obliqueness of the text.
+  ///
+  ///The value of this attribute is a number containing a floating point value indicating skew to be applied to glyphs.
+  ///The default value is `0`, indicating no skew.
+  double? obliqueness;
+
+  ///The color of the strikethrough.
+  ///
+  ///The value of this attribute is a [Color] object. The default value is `null`, indicating same as foreground color.
+  Color? strikethroughColor;
+
+  ///The strikethrough style of the text.
+  ///
+  ///This value indicates whether the text has a line through it and corresponds to one of the constants described in [IOSNSUnderlineStyle].
+  ///The default value for this attribute is [IOSNSUnderlineStyle.STYLE_NONE].
+  IOSNSUnderlineStyle? strikethroughStyle;
+
+  ///The color of the stroke.
+  ///
+  ///The value of this parameter is a [Color] object.
+  ///If it is not defined (which is the case by default), it is assumed to be the same as the value of foregroundColor;
+  ///otherwise, it describes the outline color.
+  Color? strokeColor;
+
+  ///The width of the stroke.
+  ///
+  ///The value of this attribute is a number containing a floating-point value.
+  ///This value represents the amount to change the stroke width and is specified as a percentage of the font point size.
+  ///Specify `0` (the default) for no additional changes.
+  ///Specify positive values to change the stroke width alone.
+  ///Specify negative values to stroke and fill the text.
+  ///For example, a typical value for outlined text would be `3.0`.
+  double? strokeWidth;
+
+  ///The text effect.
+  ///
+  ///The value of this attribute is a [IOSNSAttributedStringTextEffectStyle] object.
+  ///The default value of this property is `null`, indicating no text effect.
+  IOSNSAttributedStringTextEffectStyle? textEffect;
+
+  ///The color of the underline.
+  ///
+  ///The value of this attribute is a [Color] object.
+  ///The default value is `null`, indicating same as foreground color.
+  Color? underlineColor;
+
+  ///The underline style of the text.
+  ///
+  ///This value indicates whether the text is underlined and corresponds to one of the constants described in [IOSNSUnderlineStyle].
+  ///The default value for this attribute is [IOSNSUnderlineStyle.STYLE_NONE].
+  IOSNSUnderlineStyle? underlineStyle;
+
+  IOSNSAttributedString({
+    required this.string,
+    this.backgroundColor,
+    this.baselineOffset,
+    this.expansion,
+    this.foregroundColor,
+    this.kern,
+    this.ligature,
+    this.obliqueness,
+    this.strikethroughColor,
+    this.strikethroughStyle,
+    this.strokeColor,
+    this.strokeWidth,
+    this.textEffect,
+    this.underlineColor,
+    this.underlineStyle,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      "string": this.string,
+      "backgroundColor": this.backgroundColor?.toHex(),
+      "baselineOffset": this.baselineOffset,
+      "expansion": this.expansion,
+      "foregroundColor": this.foregroundColor?.toHex(),
+      "kern": this.kern,
+      "ligature": this.ligature,
+      "obliqueness": this.obliqueness,
+      "strikethroughColor": this.strikethroughColor?.toHex(),
+      "strikethroughStyle": this.strikethroughStyle?.toValue(),
+      "strokeColor": this.strokeColor?.toHex(),
+      "strokeWidth": this.strokeWidth,
+      "textEffect": this.textEffect?.toValue(),
+      "underlineColor": this.underlineColor?.toHex(),
+      "underlineStyle": this.underlineStyle?.toValue(),
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    return this.toMap();
+  }
+
+  @override
+  String toString() {
+    return toMap().toString();
+  }
+}
+
+///An iOS-specific Class that represents the constants for the underline style and strikethrough style attribute keys.
+class IOSNSUnderlineStyle {
+  final int _value;
+
+  const IOSNSUnderlineStyle._internal(this._value);
+
+  static final Set<IOSNSUnderlineStyle> values = [
+    IOSNSUnderlineStyle.STYLE_NONE,
+    IOSNSUnderlineStyle.SINGLE,
+    IOSNSUnderlineStyle.THICK,
+    IOSNSUnderlineStyle.DOUBLE,
+    IOSNSUnderlineStyle.PATTERN_DOT,
+    IOSNSUnderlineStyle.PATTERN_DASH,
+    IOSNSUnderlineStyle.PATTERN_DASH_DOT,
+    IOSNSUnderlineStyle.PATTERN_DASH_DOT_DOT,
+    IOSNSUnderlineStyle.BY_WORD,
+  ].toSet();
+
+  static IOSNSUnderlineStyle? fromValue(int? value) {
+    if (value != null) {
+      try {
+        return IOSNSUnderlineStyle.values
+            .firstWhere((element) => element.toValue() == value);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  int toValue() => _value;
+
+  @override
+  String toString() {
+    switch (_value) {
+      case 1:
+        return "SINGLE";
+      case 2:
+        return "THICK";
+      case 9:
+        return "DOUBLE";
+      case 256:
+        return "PATTERN_DOT";
+      case 512:
+        return "PATTERN_DASH";
+      case 768:
+        return "PATTERN_DASH_DOT";
+      case 1024:
+        return "PATTERN_DASH_DOT_DOT";
+      case 32768:
+        return "BY_WORD";
+      case 0:
+      default:
+        return "STYLE_NONE";
+    }
+  }
+
+  ///Do not draw a line.
+  static const STYLE_NONE = const IOSNSUnderlineStyle._internal(0);
+
+  ///Draw a single line.
+  static const SINGLE = const IOSNSUnderlineStyle._internal(1);
+
+  ///Draw a thick line.
+  static const THICK = const IOSNSUnderlineStyle._internal(2);
+
+  ///Draw a double line.
+  static const DOUBLE = const IOSNSUnderlineStyle._internal(9);
+
+  ///Draw a line of dots.
+  static const PATTERN_DOT = const IOSNSUnderlineStyle._internal(256);
+
+  ///Draw a line of dashes.
+  static const PATTERN_DASH = const IOSNSUnderlineStyle._internal(512);
+
+  ///Draw a line of alternating dashes and dots.
+  static const PATTERN_DASH_DOT = const IOSNSUnderlineStyle._internal(768);
+
+  ///Draw a line of alternating dashes and two dots.
+  static const PATTERN_DASH_DOT_DOT = const IOSNSUnderlineStyle._internal(1024);
+
+  ///Draw the line only beneath or through words, not whitespace.
+  static const BY_WORD = const IOSNSUnderlineStyle._internal(32768);
+
+  bool operator ==(value) => value == _value;
+
+  @override
+  int get hashCode => _value.hashCode;
+}
+
+///An iOS-specific Class that represents the supported proxy types.
+class IOSNSAttributedStringTextEffectStyle {
+  final String _value;
+
+  const IOSNSAttributedStringTextEffectStyle._internal(this._value);
+
+  static final Set<IOSNSAttributedStringTextEffectStyle> values = [
+    IOSNSAttributedStringTextEffectStyle.LETTERPRESS_STYLE,
+  ].toSet();
+
+  static IOSNSAttributedStringTextEffectStyle? fromValue(String? value) {
+    if (value != null) {
+      try {
+        return IOSNSAttributedStringTextEffectStyle.values
+            .firstWhere((element) => element.toValue() == value);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  String toValue() => _value;
+
+  @override
+  String toString() => _value;
+
+  ///A graphical text effect that gives glyphs the appearance of letterpress printing, which involves pressing the type into the paper.
+  static const LETTERPRESS_STYLE =
+      const IOSNSAttributedStringTextEffectStyle._internal("letterpressStyle");
+
+  bool operator ==(value) => value == _value;
+
+  @override
+  int get hashCode => _value.hashCode;
+}
+
+///Android-specific class representing the size of the refresh indicator.
+class AndroidPullToRefreshSize {
+  final int _value;
+
+  const AndroidPullToRefreshSize._internal(this._value);
+
+  static final Set<AndroidPullToRefreshSize> values = [
+    AndroidPullToRefreshSize.DEFAULT,
+    AndroidPullToRefreshSize.LARGE,
+  ].toSet();
+
+  static AndroidPullToRefreshSize? fromValue(int? value) {
+    if (value != null) {
+      try {
+        return AndroidPullToRefreshSize.values
+            .firstWhere((element) => element.toValue() == value);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  int toValue() => _value;
+
+  @override
+  String toString() {
+    switch (_value) {
+      case 0:
+        return "LARGE";
+      case 1:
+      default:
+        return "DEFAULT";
+    }
+  }
+
+  ///Default size.
+  static const DEFAULT = const AndroidPullToRefreshSize._internal(1);
+
+  ///Large size.
+  static const LARGE = const AndroidPullToRefreshSize._internal(0);
+
+  bool operator ==(value) => value == _value;
+
+  @override
+  int get hashCode => _value.hashCode;
 }
